@@ -94,7 +94,7 @@ def alpha_from_measurement(effective_speed, speed_factor):
 
     numer = 1.0 - effective_speed / S
     alpha = numer / denom
-    return max(0.0, min(alpha, 2.0))
+    return max(0.0, min(alpha, 5.0))
 
 
 def optimal_speed_factor(alpha):
@@ -265,7 +265,8 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                             (actual_frac - expected_layer_frac)
                             / (1.0 / total_layers)))
                     profile_remaining = calibrated_eta_remaining(
-                        cal, current_layer, pil)
+                        cal, current_layer, pil,
+                        speed_factor=speed_factor)
         except Exception:
             pass
 

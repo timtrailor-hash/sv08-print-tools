@@ -265,7 +265,7 @@ def calibrate_profile(profile, measured_alpha, current_layer,
     calibrated = []
     for l in profile["layers"]:
         raw_a = l.get("raw_alpha", l.get("alpha", 1.0))
-        cal_a = max(0.01, min(raw_a * alpha_cal, 2.0))
+        cal_a = max(0.01, min(raw_a * alpha_cal, 5.0))
         opt = optimal_speed(cal_a)
         opt_pct = max(round(opt * 100), 50)
 
@@ -285,12 +285,28 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
 
 def calibrated_eta_remaining(calibrated_layers, current_layer,
-                             progress_in_layer=0.5):
-    """Calculate remaining time from calibrated layer data."""
+                             progress_in_layer=0.5, speed_factor=None):
+    """Calculate remaining time from calibrated layer data.
+
+    Current layer uses actual speed_factor (since auto-speed can't adjust
+    mid-layer). Future layers use their pre-computed optimal-speed times
+    (auto-speed will set them there on layer change).
+    """
     remaining = 0.0
     for l in calibrated_layers:
         if l["layer"] < current_layer:
             continue
+        elif l["layer"] == current_layer and speed_factor is not None:
+            # Current layer: recalculate at actual speed, not optimal
+            cal_a = l["calibrated_alpha"]
+            S = max(speed_factor, 0.1)
+            opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
+            R_actual = (1.0 / S + cal_a * S) / (1.0 + cal_a)
+            R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+            actual_time = (l["time_calibrated_s"] * R_actual / R_optimal
+                           if R_optimal > 0.001
+                           else l["time_calibrated_s"])
+            remaining += actual_time * (1.0 - progress_in_layer)
         elif l["layer"] == current_layer:
             remaining += l["time_calibrated_s"] * (1.0 - progress_in_layer)
         else:
