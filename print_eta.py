@@ -364,6 +364,10 @@ def log_snapshot(print_data):
         "layer_alpha": print_data.get("layer_alpha"),
         "speed_adjusted": print_data.get("speed_adjusted", False),
         "speed_adjusted_to": print_data.get("speed_adjusted_to"),
+        # Calibration data for tracking profile accuracy
+        "time_cal_factor": print_data.get("time_cal_factor"),
+        "profile_remaining_s": print_data.get("profile_remaining_s"),
+        "confidence": print_data.get("confidence"),
     }
 
     with open(TRACKER_FILE, "a") as f:
@@ -377,8 +381,57 @@ def log_snapshot(print_data):
 _last_logged_layer = {"layer": -1, "elapsed": 0, "filename": ""}
 
 
+def _get_profile_layer_data(filename, layer_num, alpha, speed_factor, elapsed_s):
+    """Get profile predicted time for a specific layer (for logging)."""
+    try:
+        from gcode_profile import (load_profile, calibrate_profile,
+                                   get_layer_info)
+        profile = load_profile(filename) if filename else None
+        if not profile:
+            return {}
+
+        raw_layer = get_layer_info(profile, layer_num)
+        raw_time = raw_layer.get("time_1x_s", 0) if raw_layer else 0
+        raw_alpha = raw_layer.get("raw_alpha", 0) if raw_layer else 0
+        move_time = raw_layer.get("move_time_s", 0) if raw_layer else 0
+        fixed_overhead = raw_layer.get("fixed_overhead_s", 0) if raw_layer else 0
+        retractions = raw_layer.get("retractions", 0) if raw_layer else 0
+        segments = raw_layer.get("segments", 0) if raw_layer else 0
+
+        # Get calibrated data
+        cal_data = {}
+        if alpha and layer_num > 0:
+            cal = calibrate_profile(profile, alpha, layer_num,
+                                    speed_factor, elapsed_s)
+            for l in cal:
+                if l["layer"] == layer_num:
+                    cal_data = l
+                    break
+
+        return {
+            "profile_time_1x_s": round(raw_time, 1),
+            "profile_raw_alpha": round(raw_alpha, 4),
+            "profile_move_time_s": round(move_time, 1),
+            "profile_fixed_overhead_s": round(fixed_overhead, 1),
+            "profile_retractions": retractions,
+            "profile_segments": segments,
+            "profile_calibrated_time_s": cal_data.get("time_calibrated_s", 0),
+            "profile_calibrated_alpha": cal_data.get("calibrated_alpha", 0),
+            "profile_optimal_speed_pct": cal_data.get("optimal_speed_pct", 0),
+        }
+    except Exception:
+        return {}
+
+
 def _log_layer_transition(print_data):
-    """Log when a new layer starts, recording actual time for the previous layer."""
+    """Log when a new layer starts, recording actual time for the previous layer.
+
+    Captures comprehensive per-layer data for optimization:
+    - Actual time vs profile predicted time
+    - Speed factor, alpha (global + per-layer)
+    - Profile calibration data (cal factor, optimal speed)
+    - Auto-speed adjustments
+    """
     global _last_logged_layer
     cur = print_data.get("current_layer", 0)
     elapsed = print_data.get("print_duration", 0)
@@ -392,17 +445,43 @@ def _log_layer_transition(print_data):
         return  # same layer, skip
 
     if _last_logged_layer["layer"] >= 0:
-        # Log completed layer
+        # Log completed layer with full detail
         actual_time = elapsed - _last_logged_layer["elapsed"]
+        alpha = print_data.get("alpha")
+        speed_factor = print_data.get("speed_factor", 1.0)
+
         entry = {
             "ts": datetime.now().isoformat(),
             "file": filename,
             "layer": _last_logged_layer["layer"],
             "actual_time_s": round(actual_time, 1),
-            "speed_factor": print_data.get("speed_factor", 1.0),
-            "alpha": print_data.get("alpha"),
+            "elapsed_total_s": round(elapsed, 1),
+            "speed_factor": speed_factor,
+            "alpha": alpha,
             "layer_alpha": print_data.get("layer_alpha"),
+            "effective_speed": print_data.get("effective_speed"),
+            "optimal_speed_pct": print_data.get("optimal_speed_pct"),
+            "remaining_s": print_data.get("remaining_s"),
+            "eta_method": print_data.get("eta_method"),
+            "speed_adjusted": print_data.get("speed_adjusted", False),
+            "speed_adjusted_to": print_data.get("speed_adjusted_to"),
+            "live_velocity": print_data.get("live_velocity", 0),
+            "bed_temp": print_data.get("bed_temp", 0),
+            "nozzle_temp": print_data.get("nozzle_temp", 0),
         }
+
+        # Add profile predicted data for this layer
+        profile_data = _get_profile_layer_data(
+            filename, _last_logged_layer["layer"],
+            alpha, speed_factor, _last_logged_layer["elapsed"])
+        entry.update(profile_data)
+
+        # Calculate prediction error if we have both actual and predicted
+        cal_time = profile_data.get("profile_calibrated_time_s", 0)
+        if cal_time > 0 and actual_time > 0:
+            entry["prediction_error_pct"] = round(
+                (cal_time - actual_time) / actual_time * 100, 1)
+
         try:
             with open(LAYER_LOG_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -412,25 +491,165 @@ def _log_layer_transition(print_data):
     _last_logged_layer = {"layer": cur, "elapsed": elapsed, "filename": filename}
 
 
+PRINT_SUMMARY_DIR = os.path.join(TRACKER_DIR, "print_summaries")
+os.makedirs(PRINT_SUMMARY_DIR, exist_ok=True)
+
+
 def save_completed_job(job_data):
-    """Save a completed job for future correction factor tuning."""
+    """Save a completed job for future correction factor tuning.
+
+    Also generates a comprehensive per-layer summary for optimization.
+    """
     jobs = []
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE) as f:
             jobs = json.load(f)
 
+    actual_time = job_data.get("print_duration", 0)
+    estimated_time = job_data.get("estimated_time", 0)
+
     jobs.append({
         "ts": datetime.now().isoformat(),
         "file": job_data.get("filename", ""),
-        "estimated_time": job_data.get("estimated_time", 0),
-        "actual_time": job_data.get("print_duration", 0),
+        "estimated_time": estimated_time,
+        "actual_time": actual_time,
         "speed_factor": job_data.get("speed_factor", 1.0),
-        "ratio": (job_data.get("print_duration", 0) /
-                  job_data.get("estimated_time", 1)) if job_data.get("estimated_time") else None,
+        "ratio": (actual_time / estimated_time) if estimated_time else None,
     })
 
     with open(HISTORY_FILE, "w") as f:
         json.dump(jobs, f, indent=2)
+
+    # Generate comprehensive print summary
+    _generate_print_summary(job_data)
+
+
+def _generate_print_summary(job_data):
+    """Generate a detailed per-layer summary comparing predicted vs actual.
+
+    Saved as JSON in /tmp/printer_status/print_summaries/<filename>_<timestamp>.json
+    for future analysis and optimization.
+    """
+    filename = job_data.get("filename", "unknown")
+    actual_total = job_data.get("print_duration", 0)
+    estimated_total = job_data.get("estimated_time", 0)
+
+    summary = {
+        "generated": datetime.now().isoformat(),
+        "filename": filename,
+        "actual_total_s": round(actual_total, 1),
+        "actual_total_h": round(actual_total / 3600, 2) if actual_total else 0,
+        "slicer_estimated_s": round(estimated_total, 1),
+        "slicer_accuracy_pct": round(
+            estimated_total / actual_total * 100, 1) if actual_total else 0,
+        "final_speed_factor": job_data.get("speed_factor", 1.0),
+        "final_alpha": job_data.get("alpha"),
+    }
+
+    # Load profile for per-layer analysis
+    try:
+        from gcode_profile import load_profile
+        profile = load_profile(filename) if filename else None
+        if profile:
+            summary["profile_total_1x_s"] = profile.get("total_time_1x_s", 0)
+            summary["profile_total_1x_h"] = round(
+                profile.get("total_time_1x_s", 0) / 3600, 2)
+            summary["profile_total_optimal_s"] = profile.get(
+                "total_time_optimal_s", 0)
+            summary["profile_layers"] = profile.get("total_layers", 0)
+            summary["profile_generated"] = profile.get("generated", "")
+
+            # Per-layer profile data
+            layer_profiles = []
+            for l in profile.get("layers", []):
+                layer_profiles.append({
+                    "layer": l["layer"],
+                    "z": l.get("z", 0),
+                    "segments": l.get("segments", 0),
+                    "distance_mm": l.get("distance_mm", 0),
+                    "raw_alpha": l.get("raw_alpha", l.get("alpha", 0)),
+                    "optimal_speed_pct": l.get("optimal_speed_pct", 100),
+                    "time_1x_s": l.get("time_1x_s", 0),
+                    "move_time_s": l.get("move_time_s", 0),
+                    "fixed_overhead_s": l.get("fixed_overhead_s", 0),
+                    "retractions": l.get("retractions", 0),
+                    "zhop_count": l.get("zhop_count", 0),
+                })
+            summary["profile_per_layer"] = layer_profiles
+    except Exception:
+        pass
+
+    # Load layer log for actual per-layer times
+    try:
+        if os.path.exists(LAYER_LOG_FILE):
+            actual_layers = []
+            with open(LAYER_LOG_FILE) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("file") == filename:
+                            actual_layers.append(entry)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            summary["actual_per_layer"] = actual_layers
+            summary["actual_layers_logged"] = len(actual_layers)
+
+            # Calculate per-layer accuracy stats
+            if actual_layers and summary.get("profile_per_layer"):
+                profile_by_layer = {
+                    l["layer"]: l for l in summary["profile_per_layer"]}
+                errors = []
+                for al in actual_layers:
+                    pl = profile_by_layer.get(al["layer"])
+                    if pl and al.get("actual_time_s", 0) > 0:
+                        err = al.get("prediction_error_pct")
+                        if err is not None:
+                            errors.append(err)
+                if errors:
+                    summary["layer_prediction_stats"] = {
+                        "count": len(errors),
+                        "mean_error_pct": round(sum(errors) / len(errors), 1),
+                        "median_error_pct": round(
+                            sorted(errors)[len(errors) // 2], 1),
+                        "max_overestimate_pct": round(max(errors), 1),
+                        "max_underestimate_pct": round(min(errors), 1),
+                    }
+    except Exception:
+        pass
+
+    # Load tracker data for speed history
+    try:
+        if os.path.exists(TRACKER_FILE):
+            speed_history = []
+            with open(TRACKER_FILE) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("file") == filename:
+                            speed_history.append({
+                                "ts": entry.get("ts"),
+                                "progress": entry.get("progress"),
+                                "speed_factor": entry.get("speed_factor"),
+                                "layer": entry.get("current_layer"),
+                                "remaining_s": entry.get("remaining_s"),
+                                "alpha": entry.get("alpha"),
+                            })
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            summary["speed_history_count"] = len(speed_history)
+            summary["speed_history"] = speed_history
+    except Exception:
+        pass
+
+    # Save summary
+    safe_name = filename.replace("/", "_").replace(" ", "_")[:80]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_file = os.path.join(PRINT_SUMMARY_DIR, f"{safe_name}_{ts}.json")
+    try:
+        with open(summary_file, "w") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
 
 
 def get_correction_factor():
