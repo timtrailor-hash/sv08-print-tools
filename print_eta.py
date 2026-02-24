@@ -237,107 +237,80 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
             blended_eff = effective_speed if effective_speed > 0.1 else predicted_eff
 
         # ── Calculate remaining time ──
-        slicer_left = estimated_time_s * (1 - progress_pct / 100)
+        # Strategy: use the gcode profile as single source of truth when
+        # available.  It knows every layer's geometry and self-corrects
+        # by comparing expected vs actual elapsed time (time_cal_factor).
+        # Only fall back to pace/slicer when no profile exists.
 
-        # Method 1: Slicer-based (remaining slicer time / effective speed)
-        slicer_remaining = (slicer_left / max(blended_eff, 0.1)) * correction
-
-        # Method 2: Pace-based (linear extrapolation from progress)
-        pace_total = print_duration_s / (progress_pct / 100)
-        pace_remaining = pace_total - print_duration_s
-
-        # ── Method 3: Profile-based (per-layer gcode analysis) ──
         profile_remaining = None
         try:
             from gcode_profile import (load_profile, calibrate_profile,
                                        calibrated_eta_remaining)
             profile = load_profile(filename) if filename else None
-            if profile and alpha and current_layer > 2:
+            if profile and alpha and current_layer > 0:
                 cal = calibrate_profile(profile, alpha, current_layer, S,
                                                elapsed_time_s=print_duration_s)
                 if cal:
-                    # Estimate progress within current layer
                     pil = 0.5
                     if total_layers > 0:
                         expected_layer_frac = current_layer / total_layers
                         actual_frac = progress_pct / 100
+                        layer_span = 1.0 / total_layers if total_layers > 0 else 1.0
                         pil = max(0.1, min(0.9,
-                            (actual_frac - expected_layer_frac)
-                            / (1.0 / total_layers)))
+                            (actual_frac - expected_layer_frac) / layer_span))
                     profile_remaining = calibrated_eta_remaining(
                         cal, current_layer, pil,
                         speed_factor=speed_factor)
         except Exception:
             pass
 
-        # ── Adaptive blend weights (learned from completed prints) ──
-        try:
-            from eta_learner import get_blend_weights, log_prediction
-            weights = get_blend_weights(progress_pct, alpha)
-            w_pace = weights.get("pace", 0.5)
-            w_slicer = weights.get("slicer", 0.3)
-            w_profile = weights.get("profile", 0.2)
-            weights_source = "learned"
-        except Exception:
-            # Fallback to hardcoded if learner unavailable
-            if progress_pct < 5:
-                w_pace, w_slicer, w_profile = 0.0, 0.8, 0.2
-            elif progress_pct < 20:
-                f = (progress_pct - 5) / 15
-                w_pace, w_slicer, w_profile = f * 0.5, (1-f) * 0.8, 0.2
-            else:
-                w_pace = min(0.7, 0.5 + (progress_pct - 20) / 200)
-                w_slicer = (1 - w_pace) * 0.4
-                w_profile = (1 - w_pace) * 0.6
-            weights_source = "fallback"
-
-        # If no profile available, redistribute its weight
-        if not profile_remaining or profile_remaining <= 0:
-            total_non_profile = w_pace + w_slicer
-            if total_non_profile > 0:
-                w_pace = w_pace / total_non_profile
-                w_slicer = w_slicer / total_non_profile
-            else:
-                w_pace, w_slicer = 0.5, 0.5
-            w_profile = 0.0
-
-        # Normalize weights
-        total_w = w_pace + w_slicer + w_profile
-        if total_w > 0:
-            w_pace /= total_w
-            w_slicer /= total_w
-            w_profile /= total_w
-
-        remaining = (pace_remaining * w_pace +
-                     slicer_remaining * w_slicer +
-                     (profile_remaining or 0) * w_profile)
-
-        result["method"] = (
-            f"blend(pace={w_pace:.0%},slicer={w_slicer:.0%},"
-            f"profile={w_profile:.0%},α={alpha:.2f},"
-            f"{weights_source})")
         if profile_remaining and profile_remaining > 0:
+            # Profile available — use it directly, no blending
+            remaining = profile_remaining
+            result["method"] = f"profile(α={alpha:.2f})"
             result["profile_remaining_s"] = round(profile_remaining)
+        else:
+            # No profile — fall back to pace/slicer blend
+            slicer_left = estimated_time_s * (1 - progress_pct / 100)
+            slicer_remaining = (slicer_left / max(blended_eff, 0.1)) * correction
+            pace_total = print_duration_s / (progress_pct / 100)
+            pace_remaining = pace_total - print_duration_s
 
-        # Log individual method predictions for the learner
+            if progress_pct < 20:
+                # Early: trust slicer more
+                w_pace = progress_pct / 40  # 0→0.5 over 0-20%
+                remaining = pace_remaining * w_pace + slicer_remaining * (1 - w_pace)
+            else:
+                # Later: pace is more reliable than slicer
+                remaining = pace_remaining * 0.6 + slicer_remaining * 0.4
+
+            result["method"] = f"pace+slicer(α={alpha:.2f})"
+
+        # Log prediction for the learner
         try:
+            from eta_learner import log_prediction
+            slicer_left = estimated_time_s * (1 - progress_pct / 100)
+            slicer_rem = (slicer_left / max(blended_eff, 0.1)) * correction
+            pace_rem = print_duration_s / (progress_pct / 100) - print_duration_s
             log_prediction(
                 filename=filename,
                 progress_pct=progress_pct,
                 alpha=alpha,
                 elapsed_s=print_duration_s,
-                pace_remaining_s=pace_remaining,
-                slicer_remaining_s=slicer_remaining,
+                pace_remaining_s=pace_rem,
+                slicer_remaining_s=slicer_rem,
                 profile_remaining_s=profile_remaining,
                 blended_remaining_s=remaining,
                 speed_factor=speed_factor,
                 current_layer=current_layer,
             )
         except Exception:
-            pass  # logging failure is non-critical
+            pass
 
         # Confidence
-        if progress_pct < 5:
+        if profile_remaining and profile_remaining > 0:
+            result["confidence"] = "high" if progress_pct >= 5 else "medium"
+        elif progress_pct < 5:
             result["confidence"] = "low"
         elif progress_pct < 15:
             result["confidence"] = "medium"
@@ -360,6 +333,9 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
 
 # ── Logging & history ──────────────────────────────────────────
 
+LAYER_LOG_FILE = os.path.join(TRACKER_DIR, "layer_log.jsonl")
+
+
 def log_snapshot(print_data):
     """Append a progress snapshot to the tracker file for future analysis."""
     if not print_data.get("filename") or print_data.get("state") != "printing":
@@ -379,10 +355,61 @@ def log_snapshot(print_data):
         "bed_temp": print_data.get("bed_temp", 0),
         "nozzle_temp": print_data.get("nozzle_temp", 0),
         "filament_used_mm": print_data.get("filament_used_mm", 0),
+        # ETA and profile data for optimization
+        "alpha": print_data.get("alpha"),
+        "eta_method": print_data.get("eta_method"),
+        "remaining_s": print_data.get("remaining_s"),
+        "effective_speed": print_data.get("effective_speed"),
+        "optimal_speed_pct": print_data.get("optimal_speed_pct"),
+        "layer_alpha": print_data.get("layer_alpha"),
+        "speed_adjusted": print_data.get("speed_adjusted", False),
+        "speed_adjusted_to": print_data.get("speed_adjusted_to"),
     }
 
     with open(TRACKER_FILE, "a") as f:
         f.write(json.dumps(snapshot) + "\n")
+
+    # Per-layer log: track layer transitions for actual vs predicted analysis
+    _log_layer_transition(print_data)
+
+
+# Track last logged layer to detect transitions
+_last_logged_layer = {"layer": -1, "elapsed": 0, "filename": ""}
+
+
+def _log_layer_transition(print_data):
+    """Log when a new layer starts, recording actual time for the previous layer."""
+    global _last_logged_layer
+    cur = print_data.get("current_layer", 0)
+    elapsed = print_data.get("print_duration", 0)
+    filename = print_data.get("filename", "")
+
+    # Reset on new file
+    if filename != _last_logged_layer["filename"]:
+        _last_logged_layer = {"layer": -1, "elapsed": 0, "filename": filename}
+
+    if cur <= _last_logged_layer["layer"]:
+        return  # same layer, skip
+
+    if _last_logged_layer["layer"] >= 0:
+        # Log completed layer
+        actual_time = elapsed - _last_logged_layer["elapsed"]
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "file": filename,
+            "layer": _last_logged_layer["layer"],
+            "actual_time_s": round(actual_time, 1),
+            "speed_factor": print_data.get("speed_factor", 1.0),
+            "alpha": print_data.get("alpha"),
+            "layer_alpha": print_data.get("layer_alpha"),
+        }
+        try:
+            with open(LAYER_LOG_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
+    _last_logged_layer = {"layer": cur, "elapsed": elapsed, "filename": filename}
 
 
 def save_completed_job(job_data):

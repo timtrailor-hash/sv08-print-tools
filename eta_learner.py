@@ -33,8 +33,8 @@ import os
 from datetime import datetime
 
 # Persistent storage (survives reboots, accumulates across prints)
-LEARN_DIR = os.path.expanduser(
-    "~/Documents/Claude code/printer_learning")
+LEARN_DIR = os.environ.get("PRINTER_LEARN_DIR",
+    os.path.expanduser("~/.printer_learning"))
 os.makedirs(LEARN_DIR, exist_ok=True)
 
 ACCURACY_FILE = os.path.join(LEARN_DIR, "completed_accuracy.json")
@@ -94,14 +94,14 @@ DEFAULT_WEIGHTS = {
     "50-80": {
         "simple":   {"pace": 0.65, "slicer": 0.15, "profile": 0.20},
         "moderate": {"pace": 0.55, "slicer": 0.15, "profile": 0.30},
-        "complex":  {"pace": 0.50, "slicer": 0.10, "profile": 0.40},
-        "extreme":  {"pace": 0.50, "slicer": 0.10, "profile": 0.40},
+        "complex":  {"pace": 0.35, "slicer": 0.10, "profile": 0.55},
+        "extreme":  {"pace": 0.25, "slicer": 0.10, "profile": 0.65},
     },
     "80-100": {
         "simple":   {"pace": 0.80, "slicer": 0.10, "profile": 0.10},
         "moderate": {"pace": 0.75, "slicer": 0.10, "profile": 0.15},
-        "complex":  {"pace": 0.65, "slicer": 0.10, "profile": 0.25},
-        "extreme":  {"pace": 0.60, "slicer": 0.10, "profile": 0.30},
+        "complex":  {"pace": 0.40, "slicer": 0.10, "profile": 0.50},
+        "extreme":  {"pace": 0.20, "slicer": 0.10, "profile": 0.70},
     },
 }
 

@@ -52,6 +52,14 @@ python3 gcode_profile.py --status
 
 **Auto-speed mode** sends M220 commands to adjust the speed factor per layer -- speeding up on simple layers and backing off on complex ones. Includes smooth ramping (max 30% change per layer) to prevent jarring transitions.
 
+**What it tracks per layer:**
+- Extrusion move geometry (segment count, distance, average feedrate)
+- Travel moves with separate kinematics (higher junction velocity)
+- Firmware retractions (G10/G11) with proper retract speed timing
+- Z-hops with Z-axis trapezoid kinematics (500mm/s^2 accel, 10mm/s max)
+- Per-segment move time accumulation (not averaged -- handles varied segment sizes correctly)
+- Fixed overhead (retractions + Z-hops) separated from speed-dependent move time
+
 ### 2. `gcode_analyser.py` -- Segment Statistics
 
 Detailed breakdown of move segments by OrcaSlicer feature type (inner wall, outer wall, infill, etc.). Shows histograms of segment lengths -- useful for understanding *why* a print is slow.
@@ -64,12 +72,14 @@ python3 gcode_analyser.py "my_print.gcode"
 
 Smart ETA that accounts for speed factor vs geometry complexity. Self-calibrates alpha from live print data once >3% progress.
 
-Uses a three-method blend:
-- **Pace-based**: linear extrapolation from actual progress
-- **Slicer-based**: slicer estimate corrected by physics model
-- **Profile-based**: per-layer predictions from gcode_profile
+When a gcode profile is available, uses it as the **single source of truth** -- the profile knows every layer's geometry and self-corrects by comparing predicted vs actual elapsed time (time calibration factor). Only falls back to pace/slicer blending when no profile exists.
 
-The blend weights shift as the print progresses (early on trusts slicer more, later trusts pace more).
+**Calibration approach:**
+- Alpha calibration: scales raw gcode alphas to match the live-measured alpha
+- Time calibration: compares predicted elapsed time to actual, separately tracking move time (scales with speed) and fixed overhead (doesn't scale)
+- Per-layer remaining time uses calibrated data with the current speed factor
+
+Also logs per-layer transitions (actual vs predicted time) and progress snapshots for future optimisation.
 
 ### 4. `eta_learner.py` -- Adaptive Weight Learning
 
@@ -108,7 +118,7 @@ Or set it as an environment variable:
 export MOONRAKER_URL="http://192.168.1.100:7125"
 ```
 
-That's it. The tools write temporary data to `/tmp/printer_status/` and learning data to `~/Documents/Claude code/printer_learning/` (you can change these paths in the scripts).
+That's it. The tools write temporary data to `/tmp/printer_status/` and learning data to `~/.printer_learning/` (override with `PRINTER_LEARN_DIR` env var).
 
 ### Quick Test
 
@@ -138,11 +148,17 @@ R(S) = (1/S + alpha*S) / (1 + alpha)
 When `alpha*S > 1/S`, increasing speed makes things slower. The crossover point (optimal speed) is `S = 1/sqrt(alpha)`.
 
 The profiler computes alpha per layer by:
-1. Streaming gcode from Moonraker
-2. Parsing all G0/G1 moves and collecting segment lengths
-3. Sampling junction angles (direction changes between consecutive moves)
-4. Computing effective junction velocity from Klipper's square corner velocity
-5. Calculating alpha from average segment length, feedrate, and acceleration
+1. Streaming gcode from Moonraker (handles 600MB+ files)
+2. Parsing all G0/G1 moves with per-segment trapezoid time calculation
+3. Tracking G10/G11 firmware retractions and Z-hop moves
+4. Sampling junction angles (direction changes between consecutive moves)
+5. Computing effective junction velocity from Klipper's square corner velocity
+6. Calculating alpha from average segment length, feedrate, and acceleration
+7. Separating fixed overhead (retractions, Z-hops) from speed-dependent move time
+
+**Why fixed overhead matters:** On a 47-hour articulated snake, 266K retractions and 573K Z-hops account for ~18 hours of time that doesn't speed up when you increase the speed slider. Ignoring this causes the time calibration factor to compensate incorrectly, leading to ETA drift.
+
+**Why per-segment timing matters:** Using `N * move_time(avg_segment)` underestimates because of Jensen's inequality -- the trapezoid function is concave, so `f(average) > average(f)`. Per-segment accumulation fixes this.
 
 ## Background
 

@@ -38,7 +38,8 @@ os.makedirs(PROFILE_DIR, exist_ok=True)
 
 DEFAULT_MAX_VELOCITY = 700.0      # mm/s
 DEFAULT_MAX_ACCEL = 40000.0       # mm/s² (from printer.cfg, not OrcaSlicer)
-DEFAULT_SCV = 5.0                 # square corner velocity mm/s
+DEFAULT_SCV = 5.0                 # square corner velocity mm/s (extrusion)
+DEFAULT_TRAVEL_SCV = 10.0         # travel moves tolerate higher corner speed
 
 
 # ── Fetch printer config from Moonraker ───────────────────────────
@@ -234,14 +235,16 @@ def calibrate_profile(profile, measured_alpha, current_layer,
     # (weighted by time_1x to give more weight to longer layers)
     total_weight = 0.0
     weighted_sum = 0.0
-    profile_elapsed = 0.0
+    profile_move_elapsed = 0.0
+    profile_fixed_elapsed = 0.0
     for l in profile["layers"]:
         if l["layer"] > current_layer:
             break
         w = l.get("time_1x_s", 1.0)
         weighted_sum += l.get("raw_alpha", l.get("alpha", 1.0)) * w
         total_weight += w
-        profile_elapsed += l.get("time_1x_s", 0)
+        profile_move_elapsed += l.get("move_time_s", l.get("time_1x_s", 0))
+        profile_fixed_elapsed += l.get("fixed_overhead_s", 0)
 
     if total_weight < 1.0 or weighted_sum < 0.01:
         return []
@@ -252,14 +255,17 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
     alpha_cal = measured_alpha / avg_raw
 
-    # Time calibration
+    # Time calibration — only move time scales with speed factor
     time_cal_factor = 1.0
+    profile_elapsed = profile_move_elapsed + profile_fixed_elapsed
     if elapsed_time_s > 60 and profile_elapsed > 60:
         S = max(speed_factor, 0.1)
-        predicted_elapsed = profile_elapsed * (
-            (1.0 / S + measured_alpha * S) / (1.0 + measured_alpha))
+        predicted_elapsed = (
+            profile_move_elapsed * (
+                (1.0 / S + measured_alpha * S) / (1.0 + measured_alpha))
+            + profile_fixed_elapsed)
         time_cal_factor = elapsed_time_s / predicted_elapsed
-        time_cal_factor = max(0.3, min(time_cal_factor, 1.5))
+        time_cal_factor = max(0.3, min(time_cal_factor, 3.0))
 
     # Apply calibration to all layers
     calibrated = []
@@ -270,7 +276,10 @@ def calibrate_profile(profile, measured_alpha, current_layer,
         opt_pct = max(round(opt * 100), 50)
 
         ratio = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
-        time_cal = l.get("time_1x_s", 0) * ratio * time_cal_factor
+        # Only apply speed ratio to move time, not fixed overhead
+        move_t = l.get("move_time_s", l.get("time_1x_s", 0))
+        fixed_t = l.get("fixed_overhead_s", 0)
+        time_cal = (move_t * ratio + fixed_t) * time_cal_factor
 
         calibrated.append({
             "layer": l["layer"],
@@ -278,6 +287,8 @@ def calibrate_profile(profile, measured_alpha, current_layer,
             "calibrated_alpha": round(cal_a, 4),
             "optimal_speed_pct": opt_pct,
             "time_calibrated_s": round(time_cal, 1),
+            "move_time_s": move_t,
+            "fixed_overhead_s": fixed_t,
             "time_1x_s": l.get("time_1x_s", 0),
         })
 
@@ -297,15 +308,18 @@ def calibrated_eta_remaining(calibrated_layers, current_layer,
         if l["layer"] < current_layer:
             continue
         elif l["layer"] == current_layer and speed_factor is not None:
-            # Current layer: recalculate at actual speed, not optimal
+            # Current layer: recalculate move time at actual speed, not optimal
             cal_a = l["calibrated_alpha"]
             S = max(speed_factor, 0.1)
             opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
             R_actual = (1.0 / S + cal_a * S) / (1.0 + cal_a)
             R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
-            actual_time = (l["time_calibrated_s"] * R_actual / R_optimal
-                           if R_optimal > 0.001
-                           else l["time_calibrated_s"])
+            # Split: only move portion scales with speed ratio
+            fixed_t = l.get("fixed_overhead_s", 0)
+            move_cal = l["time_calibrated_s"] - fixed_t
+            actual_move = (move_cal * R_actual / R_optimal
+                           if R_optimal > 0.001 else move_cal)
+            actual_time = actual_move + fixed_t
             remaining += actual_time * (1.0 - progress_in_layer)
         elif l["layer"] == current_layer:
             remaining += l["time_calibrated_s"] * (1.0 - progress_in_layer)
@@ -379,9 +393,18 @@ def analyze_gcode(filename, config, progress_callback=None):
         return {
             "segments": 0,       # extrusion move count
             "distance_mm": 0.0,  # total extrusion XY distance
-            "feedrate_sum": 0.0, # sum of feedrates (for averaging)
+            "feedrate_sum": 0.0, # sum of feedrates (arithmetic, for averaging)
+            "cruise_time_sum": 0.0,  # Σ(dist/feedrate) — for harmonic mean
             "accel_sum": 0.0,    # sum of per-feature accelerations
+            "ext_time_sum": 0.0, # accumulated per-segment extrusion move time
+            "travel_time_sum": 0.0, # accumulated per-segment travel move time
             "travel_distance": 0.0,  # total travel (non-extrusion) XY distance
+            "travel_segments": 0,    # travel move count
+            "travel_feedrate_sum": 0.0,  # sum of travel feedrates
+            "travel_cruise_time_sum": 0.0,  # Σ(dist/feedrate) for travel
+            "retractions": 0,    # G10 firmware retract count
+            "zhop_distance": 0.0,  # total Z-only move distance (mm)
+            "zhop_count": 0,     # Z-only move count
             "junction_cos": [],  # reservoir-sampled cos(θ) between moves
             "prev_dx": 0.0,
             "prev_dy": 0.0,
@@ -392,6 +415,7 @@ def analyze_gcode(filename, config, progress_callback=None):
     layer_z[0] = 0.0
 
     cur_feature_accel = accel  # tracks SET_VELOCITY_LIMIT ACCEL=
+    eff_jv_running = scv  # running junction velocity estimate
 
     last_progress_time = time.time()
     start_time = time.time()
@@ -444,20 +468,32 @@ def analyze_gcode(filename, config, progress_callback=None):
         if line.startswith('SET_') or line.startswith('M') or line.startswith('T'):
             continue
 
-        # Only process G0/G1
+        # Process G commands
         if len(line) < 2:
             continue
         c0 = line[0]
         if c0 != 'G' and c0 != 'g':
             continue
         c1 = line[1] if len(line) > 1 else ''
+
+        # G10 = firmware retract, G11 = firmware unretract
+        if c1 == '1' and len(line) > 2 and line[2] == '0':
+            if cur_layer not in layer_data:
+                layer_data[cur_layer] = new_layer_data()
+            layer_data[cur_layer]["retractions"] += 1
+            continue
+        if c1 == '1' and len(line) > 2 and line[2] == '1':
+            # G11 unretract — counted as part of retraction pair
+            continue
+
+        # Only process G0/G1
         if c1 == '0':
             is_g1 = False
         elif c1 == '1':
             is_g1 = True
         else:
             continue
-        # Must be followed by space/tab/end (not G10, G28, etc.)
+        # Must be followed by space/tab/end (not G28, etc.)
         if len(line) > 2 and line[2] not in (' ', '\t', ';'):
             continue
 
@@ -471,6 +507,9 @@ def analyze_gcode(filename, config, progress_callback=None):
         new_x = params.get('X', cur_x)
         new_y = params.get('Y', cur_y)
         new_z = params.get('Z', cur_z)
+
+        # Z-only move (Z-hop): no XY movement but Z changes
+        dz = abs(new_z - cur_z)
         cur_z = new_z
 
         # Calculate XY distance
@@ -479,7 +518,13 @@ def analyze_gcode(filename, config, progress_callback=None):
         dist_sq = dx * dx + dy * dy
         cur_x, cur_y = new_x, new_y
 
-        if dist_sq < 0.000001:  # < 0.001mm
+        if dist_sq < 0.000001:  # < 0.001mm XY
+            if dz > 0.001:
+                # Pure Z move (Z-hop or layer change)
+                if cur_layer not in layer_data:
+                    layer_data[cur_layer] = new_layer_data()
+                layer_data[cur_layer]["zhop_distance"] += dz
+                layer_data[cur_layer]["zhop_count"] += 1
             continue
 
         dist = math.sqrt(dist_sq)
@@ -490,15 +535,49 @@ def analyze_gcode(filename, config, progress_callback=None):
         ld = layer_data[cur_layer]
 
         if not is_extrusion:
-            # Travel move — just accumulate distance
+            # Travel move — accumulate distance, feedrate, and per-segment time
             ld["travel_distance"] += dist
+            ld["travel_segments"] += 1
+            capped_feed = min(cur_feedrate, max_vel)
+            ld["travel_feedrate_sum"] += capped_feed
+            if capped_feed > 0.01:
+                ld["travel_cruise_time_sum"] += dist / capped_feed
+            # Per-segment travel time (inline trapezoid)
+            if dist > 0.001 and accel > 0.1:
+                tv = capped_feed
+                tjv = min(DEFAULT_TRAVEL_SCV, tv)
+                td_ad = (tv * tv - tjv * tjv) / (2.0 * accel)
+                if td_ad + td_ad > dist:
+                    tvp = math.sqrt(tjv * tjv + accel * dist)
+                    ld["travel_time_sum"] += 2.0 * (tvp - tjv) / accel
+                else:
+                    tt_ad = (tv - tjv) / accel
+                    ld["travel_time_sum"] += 2.0 * tt_ad + (dist - 2.0 * td_ad) / tv
             continue
 
         # Extrusion move — accumulate geometry stats
         ld["segments"] += 1
         ld["distance_mm"] += dist
-        ld["feedrate_sum"] += min(cur_feedrate, max_vel)
-        ld["accel_sum"] += min(cur_feature_accel, accel)
+        capped_feed = min(cur_feedrate, max_vel)
+        ld["feedrate_sum"] += capped_feed
+        if capped_feed > 0.01:
+            ld["cruise_time_sum"] += dist / capped_feed
+        seg_accel = min(cur_feature_accel, accel)
+        ld["accel_sum"] += seg_accel
+        # Accumulate per-segment move time (inline trapezoid calc)
+        # This is much more accurate than n*move_time(avg) for varied segments
+        if dist > 0.001 and seg_accel > 0.1:
+            v = capped_feed
+            jv = min(eff_jv_running, v) if ld["prev_valid"] else min(scv, v)
+            d_ad = (v * v - jv * jv) / (2.0 * seg_accel)
+            if d_ad + d_ad > dist:
+                # Triangle — never reaches cruise
+                vp = math.sqrt(jv * jv + seg_accel * dist)
+                seg_t = 2.0 * (vp - jv) / seg_accel
+            else:
+                t_ad = (v - jv) / seg_accel
+                seg_t = 2.0 * t_ad + (dist - 2.0 * d_ad) / v
+            ld["ext_time_sum"] += seg_t
 
         # Junction angle sampling (reservoir sampling, max 1000 per layer)
         if ld["prev_valid"]:
@@ -533,7 +612,11 @@ def analyze_gcode(filename, config, progress_callback=None):
         n_seg = ld["segments"]
         if n_seg > 0:
             avg_seg = ld["distance_mm"] / n_seg
-            avg_feed = ld["feedrate_sum"] / n_seg
+            # Harmonic mean feedrate: correct average for rates
+            if ld["cruise_time_sum"] > 0.001:
+                avg_feed = ld["distance_mm"] / ld["cruise_time_sum"]
+            else:
+                avg_feed = ld["feedrate_sum"] / n_seg
             avg_accel = ld["accel_sum"] / n_seg
         else:
             avg_seg = 0
@@ -548,21 +631,54 @@ def analyze_gcode(filename, config, progress_callback=None):
         opt = optimal_speed(raw_a)
         opt_pct = max(round(opt * 100), 50)  # floor at 50%
 
-        # Time estimate: extrusion time + travel time
-        if n_seg > 0:
+        # Time estimate: use per-segment accumulated times when available
+        # (much more accurate than n*move_time(avg) for varied segment sizes)
+        ext_time = ld.get("ext_time_sum", 0.0)
+        if ext_time < 0.001 and n_seg > 0:
+            # Fallback: averaged estimate
             ext_time = n_seg * move_time(avg_seg, avg_feed, avg_accel, eff_jv)[0]
-        else:
-            ext_time = 0.0
-        # Travel time: simple estimate with 1.3x overhead for accel/decel
-        travel_time = ld["travel_distance"] / max(avg_feed, 10.0) * 1.3
-        total_time = ext_time + travel_time
 
-        # Time at optimal speed
+        travel_time = ld.get("travel_time_sum", 0.0)
+        if travel_time < 0.001 and ld["travel_segments"] > 0:
+            # Fallback: averaged estimate
+            travel_scv = DEFAULT_TRAVEL_SCV
+            n_travel = ld["travel_segments"]
+            avg_travel_feed = ld["travel_feedrate_sum"] / n_travel
+            avg_travel_dist = ld["travel_distance"] / n_travel
+            travel_time = n_travel * move_time(
+                avg_travel_dist, avg_travel_feed, accel, travel_scv)[0]
+
+        # Retraction time: each G10 retract + G11 unretract pair
+        # Klipper firmware retract: 0.8mm at 40mm/s with extruder accel
+        # Plus ~0.01s command processing overhead per operation
+        retract_dist = 0.8   # mm (from printer config)
+        retract_speed = 40.0  # mm/s (from printer config)
+        retract_per_op = retract_dist / retract_speed + 0.01  # ~0.03s
+        retract_time = ld["retractions"] * 2 * retract_per_op  # retract + unretract
+
+        # Z-hop time: trapezoid kinematics with Z accel (500mm/s²)
+        # Short Z-hops never reach max Z speed — accel dominates
+        z_max_vel = 10.0   # mm/s (from printer config)
+        z_accel = 500.0    # mm/s² (from printer config)
+        n_zhops = ld["zhop_count"]
+        if n_zhops > 0:
+            avg_zhop = ld["zhop_distance"] / n_zhops
+            zhop_time = n_zhops * move_time(avg_zhop, z_max_vel, z_accel, 0.0)[0]
+        else:
+            zhop_time = 0.0
+
+        # Fixed overhead (not affected by speed factor)
+        fixed_overhead = retract_time + zhop_time
+        # Speed-dependent time (extrusion + travel)
+        move_time_total = ext_time + travel_time
+        total_time = move_time_total + fixed_overhead
+
+        # Time at optimal speed — only move time scales with speed
         if raw_a > 0.001:
             ratio_optimal = (1.0 / opt + raw_a * opt) / (1.0 + raw_a)
         else:
             ratio_optimal = 1.0 / opt
-        time_optimal = total_time * ratio_optimal
+        time_optimal = move_time_total * ratio_optimal + fixed_overhead
 
         layers.append({
             "layer": layer_num,
@@ -576,7 +692,11 @@ def analyze_gcode(filename, config, progress_callback=None):
             "alpha": round(raw_a, 4),
             "optimal_speed_pct": opt_pct,
             "time_1x_s": round(total_time, 1),
+            "move_time_s": round(move_time_total, 1),
+            "fixed_overhead_s": round(fixed_overhead, 1),
             "time_optimal_s": round(time_optimal, 1),
+            "retractions": ld["retractions"],
+            "zhop_count": ld["zhop_count"],
         })
 
     elapsed_total = time.time() - start_time
