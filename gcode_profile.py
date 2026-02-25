@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import math
 import os
 import random
@@ -26,6 +27,8 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+log = logging.getLogger("gcode_profile")
 
 try:
     from printer_config import SOVOL_IP, MOONRAKER_PORT
@@ -78,7 +81,7 @@ def fetch_printer_kinematics():
             config["scv"] = float(printer["square_corner_velocity"])
         return config
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     # Fallback: live toolhead values (may be lowered by slicer)
     try:
@@ -213,11 +216,16 @@ def layer_alpha_from_geometry(avg_segment_mm, avg_feedrate, accel,
     return 1.0
 
 
-def optimal_speed(alpha):
-    """Optimal speed factor = 1/sqrt(alpha)."""
-    if alpha <= 0.001:
-        return 10.0
-    return min(1.0 / math.sqrt(alpha), 10.0)
+try:
+    from printer_physics import optimal_speed_factor as optimal_speed, speed_time_ratio as _str
+except ImportError:
+    def optimal_speed(alpha):
+        if alpha <= 0.001:
+            return 10.0
+        return min(1.0 / math.sqrt(alpha), 10.0)
+    def _str(S, a):
+        S = max(S, 0.1); a = max(a, 0.001)
+        return (1.0 / S + a * S) / (1.0 + a)
 
 
 # ── Calibration ──────────────────────────────────────────────────
@@ -274,7 +282,7 @@ def calibrate_profile(profile, measured_alpha, current_layer,
             raw_a = l.get("raw_alpha", l.get("alpha", 1.0))
             cal_a = max(0.01, min(raw_a * alpha_cal, 5.0))
             opt = optimal_speed(cal_a)
-            ratio = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+            ratio = _str(opt, cal_a)
             move_t = l.get("move_time_s", l.get("time_1x_s", 0))
             fixed_t = l.get("fixed_overhead_s", 0)
             predicted_elapsed += move_t * ratio + fixed_t
@@ -290,7 +298,7 @@ def calibrate_profile(profile, measured_alpha, current_layer,
         opt = optimal_speed(cal_a)
         opt_pct = max(round(opt * 100), 50)
 
-        ratio = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+        ratio = _str(opt, cal_a)
         # Only apply speed ratio to move time, not fixed overhead
         move_t = l.get("move_time_s", l.get("time_1x_s", 0))
         fixed_t = l.get("fixed_overhead_s", 0)
@@ -315,45 +323,35 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
 
 def calibrated_eta_remaining(calibrated_layers, current_layer,
-                             progress_in_layer=0.5, speed_factor=None,
-                             max_speed_pct=None):
+                             progress_in_layer=0.5, speed_factor=None):
     """Calculate remaining time from calibrated layer data.
 
     Current layer uses actual speed_factor (since auto-speed can't adjust
-    mid-layer). Future layers use min(optimal, max_speed_pct) to match
-    what auto-speed will actually set.
+    mid-layer). Future layers use their pre-computed optimal-speed times
+    (auto-speed will set them there on layer change).
     """
     remaining = 0.0
     for l in calibrated_layers:
         if l["layer"] < current_layer:
             continue
-
-        cal_a = l["calibrated_alpha"]
-        opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
-        # Use properly calibrated move/fixed (both include time_cal_factor)
-        move_cal = l.get("move_calibrated_s", l["time_calibrated_s"])
-        fixed_cal = l.get("fixed_calibrated_s", 0)
-        R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
-
-        if l["layer"] == current_layer and speed_factor is not None:
-            # Current layer: use actual speed (can't change mid-layer)
+        elif l["layer"] == current_layer and speed_factor is not None:
+            # Current layer: recalculate move time at actual speed, not optimal
+            cal_a = l["calibrated_alpha"]
             S = max(speed_factor, 0.1)
+            opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
             R_actual = (1.0 / S + cal_a * S) / (1.0 + cal_a)
+            R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+            # Use properly calibrated move/fixed (both include time_cal_factor)
+            move_cal = l.get("move_calibrated_s", l["time_calibrated_s"])
+            fixed_cal = l.get("fixed_calibrated_s", 0)
             actual_move = (move_cal * R_actual / R_optimal
                            if R_optimal > 0.001 else move_cal)
-            remaining += (actual_move + fixed_cal) * (1.0 - progress_in_layer)
+            actual_time = actual_move + fixed_cal
+            remaining += actual_time * (1.0 - progress_in_layer)
         elif l["layer"] == current_layer:
             remaining += l["time_calibrated_s"] * (1.0 - progress_in_layer)
         else:
-            # Future layer: cap speed at max_speed_pct if set
-            if max_speed_pct and l["optimal_speed_pct"] > max_speed_pct:
-                capped_S = max_speed_pct / 100.0
-                R_capped = (1.0 / capped_S + cal_a * capped_S) / (1.0 + cal_a)
-                capped_move = (move_cal * R_capped / R_optimal
-                               if R_optimal > 0.001 else move_cal)
-                remaining += capped_move + fixed_cal
-            else:
-                remaining += l["time_calibrated_s"]
+            remaining += l["time_calibrated_s"]
     return remaining
 
 
@@ -850,8 +848,14 @@ def adjust_speed_for_layer(profile, current_layer, auto_config):
 
 # ── Profile loading (for use by other modules) ───────────────────
 
-def load_profile(filename=None):
-    """Load a cached gcode profile. Returns None if not available."""
+def load_profile(filename=None, max_age_hours=24):
+    """Load a cached gcode profile. Returns None if not available or stale.
+
+    Args:
+        filename: if provided, only return profile if it matches this file.
+        max_age_hours: invalidate profiles older than this (default 24h).
+            Catches re-sliced gcode files that have the same name.
+    """
     if not os.path.exists(PROFILE_FILE):
         return None
     try:
@@ -859,6 +863,18 @@ def load_profile(filename=None):
             profile = json.load(f)
         if filename and profile.get("filename") != filename:
             return None
+        # Invalidate stale profiles (e.g. gcode re-sliced with same name)
+        generated = profile.get("generated", "")
+        if generated:
+            try:
+                gen_time = datetime.fromisoformat(generated)
+                age_hours = (datetime.now() - gen_time).total_seconds() / 3600
+                if age_hours > max_age_hours:
+                    log.info("Profile for %s is %.0fh old, invalidating",
+                             profile.get("filename", "?"), age_hours)
+                    return None
+            except (ValueError, TypeError):
+                pass
         return profile
     except (json.JSONDecodeError, OSError):
         return None
@@ -1039,9 +1055,13 @@ def main():
     profile = analyze_gcode(filename, config, on_progress)
     print(file=sys.stderr)  # newline after progress
 
-    # Save profile
-    with open(PROFILE_FILE, "w") as f:
+    # Save profile (atomic write-to-temp + rename for crash safety)
+    tmp = PROFILE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(profile, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, PROFILE_FILE)
     print(f"\nProfile saved to {PROFILE_FILE}")
 
     # Print summary

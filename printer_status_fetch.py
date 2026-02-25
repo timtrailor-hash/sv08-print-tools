@@ -2,6 +2,7 @@
 """Fetch live status from both printers and save images/data for inline display."""
 
 import json
+import logging
 import os
 import ssl
 import sys
@@ -9,6 +10,37 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+
+# Structured logging — replaces silent except:pass blocks
+_log_path = os.path.join("/tmp/printer_status", "printer.log")
+_handler = RotatingFileHandler(_log_path, maxBytes=2_000_000, backupCount=3)
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+log = logging.getLogger("printer_fetch")
+log.addHandler(_handler)
+log.setLevel(logging.WARNING)
+
+def _log_exc(context):
+    """Log exception at WARNING level with context. Use in except blocks."""
+    log.warning("%s failed", context, exc_info=True)
+
+
+def _fetch_url(url, timeout=5, retries=3, backoff=1.0):
+    """Fetch URL with exponential backoff. Returns response bytes or raises."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                wait = backoff * (2 ** attempt)  # 1s, 2s, 4s
+                log.info("Retry %d/%d for %s after %.1fs (%s)",
+                         attempt + 1, retries - 1, url[:80], wait, e)
+                time.sleep(wait)
+    raise last_err
+
 
 OUTPUT_DIR = "/tmp/printer_status"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -68,7 +100,7 @@ def _save_eta_snapshot(result):
                             break  # Found last entry for this file, old enough
                     # If no entry found for cur_file, fall through to save
         except Exception:
-            pass
+            log.debug("suppressed", exc_info=True)
 
     # Parse remaining time from the final remaining_str (e.g. "12h 34m")
     remaining_str = result.get("remaining_str", "")
@@ -108,8 +140,10 @@ def _save_eta_snapshot(result):
     try:
         with open(ETA_SNAPSHOTS_FILE, "a") as f:
             f.write(json.dumps(snapshot) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
 
 def fetch_sovol():
@@ -121,8 +155,7 @@ def fetch_sovol():
         base = f"http://{ip}:{MOONRAKER_PORT}"
         url = f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report"
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                data = json.loads(r.read())["result"]["status"]
+            data = json.loads(_fetch_url(url, timeout=5))["result"]["status"]
             result["online"] = True
             result["connection"] = "ethernet" if ip == SOVOL_IP else "wifi_fallback"
             break
@@ -166,8 +199,8 @@ def fetch_sovol():
     if result["filename"]:
         enc = urllib.parse.quote(result["filename"])
         try:
-            with urllib.request.urlopen(f"{base}/server/files/metadata?filename={enc}", timeout=5) as r:
-                meta = json.loads(r.read())["result"]
+            meta = json.loads(_fetch_url(
+                f"{base}/server/files/metadata?filename={enc}", timeout=5))["result"]
             result["estimated_time"] = meta.get("estimated_time", 0)
             result["filament_total_mm"] = meta.get("filament_total", 0)
             result["filament_weight_g"] = meta.get("filament_weight_total", 0)
@@ -186,28 +219,28 @@ def fetch_sovol():
                 if tp:
                     thumb_url = f"{base}/server/files/gcodes/{urllib.parse.quote(tp)}"
                     thumb_path = os.path.join(OUTPUT_DIR, "sovol_thumbnail.png")
-                    with urllib.request.urlopen(thumb_url, timeout=5) as tr:
-                        with open(thumb_path, "wb") as f:
-                            f.write(tr.read())
+                    with open(thumb_path, "wb") as f:
+                        f.write(_fetch_url(thumb_url, timeout=5, retries=2))
                     result["thumbnail"] = thumb_path
         except Exception as e:
             result["meta_error"] = str(e)
 
         # Print start time from history
         try:
-            with urllib.request.urlopen(f"{base}/server/history/list?limit=1&order=desc", timeout=5) as r:
-                hist = json.loads(r.read())["result"]
+            hist = json.loads(_fetch_url(
+                f"{base}/server/history/list?limit=1&order=desc", timeout=5))["result"]
             if hist.get("jobs"):
                 result["start_time"] = hist["jobs"][0].get("start_time", 0)
-        except:
-            pass
+        except Exception:
+            _log_exc("fetch_sovol_history")
 
     # Camera snapshot (with timeout to prevent hanging)
     try:
         cam_path = os.path.join(OUTPUT_DIR, "sovol_camera.jpg")
-        with urllib.request.urlopen(f"http://{SOVOL_IP}:{SOVOL_CAMERA_PORT}/webcam/?action=snapshot", timeout=3) as r:
-            with open(cam_path, "wb") as f:
-                f.write(r.read())
+        with open(cam_path, "wb") as f:
+            f.write(_fetch_url(
+                f"http://{SOVOL_IP}:{SOVOL_CAMERA_PORT}/webcam/?action=snapshot",
+                timeout=3, retries=2))
         result["camera"] = cam_path
     except Exception as e:
         result["camera_error"] = str(e)
@@ -230,6 +263,7 @@ def fetch_sovol():
             current_layer=result.get("current_layer", 0),
             total_layers=result.get("total_layers", 0),
             filename=result.get("filename", ""),
+            printer="sovol",
         )
         if "error" not in eta_result:
             result["remaining_str"] = eta_result["remaining_str"]
@@ -326,7 +360,7 @@ def fetch_sovol():
                         if stored and stored > 0.01:
                             measured_alpha = stored
                 except Exception:
-                    pass
+                    log.debug("suppressed", exc_info=True)
 
             result["profile_available"] = True
 
@@ -358,7 +392,7 @@ def fetch_sovol():
                                 result["effective_speed_scope"] = "layer"
                                 result["speed_efficiency"] = round((1.0 / R / spd) * 100) if spd > 0 else 0
                             except Exception:
-                                pass
+                                log.debug("suppressed", exc_info=True)
                             # Update speed warning to use layer alpha
                             try:
                                 from print_eta import speed_factor_benefit, optimal_speed_factor
@@ -380,7 +414,7 @@ def fetch_sovol():
                                     else:
                                         result.pop("speed_warning", None)
                             except Exception:
-                                pass
+                                log.debug("suppressed", exc_info=True)
                             break
 
                     # Next layer preview
@@ -456,7 +490,7 @@ def fetch_sovol():
                                     optimal_speed_factor(measured_alpha) * 100)
                                 target_pct = min(target_pct, global_opt_pct)
                             except Exception:
-                                pass
+                                log.debug("suppressed", exc_info=True)
 
                             # Clamp
                             target_pct = max(
@@ -503,7 +537,7 @@ def fetch_sovol():
                                     result["speed_adjusted_to"] = target_pct
                                     result["speed_adjusted_from"] = current_pct
     except Exception:
-        pass  # Profile not available or error — non-critical
+        log.debug("suppressed", exc_info=True)  # Profile not available or error — non-critical
 
     # ── Immutable ETA snapshots — save every 5 minutes ──
     # These are frozen predictions that never get recalculated.
@@ -551,7 +585,7 @@ def fetch_sovol():
             if len(eta_history) >= 2:
                 result["eta_history"] = eta_history
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     # Speed graph from gcode profile (per-layer optimal speeds)
     try:
@@ -575,7 +609,7 @@ def fetch_sovol():
                 speed_graph.append(entry)
             result["speed_graph"] = speed_graph
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     fil_used_m = result.get("filament_used_mm", 0) / 1000
     fil_total_m = result.get("filament_total_mm", 0) / 1000
@@ -610,7 +644,7 @@ def fetch_sovol():
                         f'with title "SV08: Filament Feed Issue!" sound name "Basso"'
                     ])
                 except Exception:
-                    pass
+                    log.debug("suppressed", exc_info=True)
 
     # Extract model name from filename
     fn = result.get("filename", "")
@@ -668,7 +702,7 @@ def fetch_sovol():
                 "start_time": result.get("start_time"),
             }, f)
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     return result
 
@@ -850,7 +884,7 @@ def fetch_bambu():
         if avis:
             latest_avi = avis[-1]
             buf = io.BytesIO()
-            max_dl = 2 * 1024 * 1024  # 2MB is enough for a frame
+            max_dl = 256 * 1024  # 256KB — enough for one frame, ~8s download
             dl_count = [0]
             def _cb(data):
                 if dl_count[0] < max_dl:
@@ -879,7 +913,7 @@ def fetch_bambu():
         try:
             ftp.close()
         except Exception:
-            pass
+            log.debug("suppressed", exc_info=True)
 
         if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
             result["has_camera"] = True
@@ -924,7 +958,7 @@ def fetch_bambu():
                     del entry["snapshot_ts"]
                 result["eta_history"] = eta_history
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     return result
 

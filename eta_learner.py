@@ -152,6 +152,8 @@ def log_prediction(filename, progress_pct, alpha, elapsed_s,
 
     with open(PREDICTIONS_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 _last_progress_cache = {}

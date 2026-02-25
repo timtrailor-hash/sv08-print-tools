@@ -34,14 +34,17 @@ Also logs snapshots to a tracker file for future analysis.
 """
 
 import json
+import logging
 import math
 import os
 from datetime import datetime, timedelta
 
+log = logging.getLogger("print_eta")
+
 TRACKER_DIR = "/tmp/printer_status"
 TRACKER_FILE = os.path.join(TRACKER_DIR, "print_tracker.jsonl")
 HISTORY_FILE = os.path.join(TRACKER_DIR, "completed_jobs.json")
-ALPHA_FILE = os.path.join(TRACKER_DIR, "current_alpha.json")
+ALPHA_FILE_LEGACY = os.path.join(TRACKER_DIR, "current_alpha.json")
 os.makedirs(TRACKER_DIR, exist_ok=True)
 
 # Slicer correction factor. OrcaSlicer machine limits were corrected
@@ -57,62 +60,43 @@ DEFAULT_ALPHA = 0.40
 
 
 # ── Physics model ──────────────────────────────────────────────
+# Canonical implementations live in printer_physics.py.
+# Imported here for backward compatibility (all existing callers
+# do `from print_eta import speed_time_ratio` etc.)
 
-def speed_time_ratio(speed_factor, alpha):
-    """Predict time ratio T(S)/T(1) using trapezoid move physics.
+try:
+    from printer_physics import (
+        speed_time_ratio,
+        optimal_speed_factor,
+        alpha_from_measurement,
+    )
+except ImportError:
+    # Standalone fallback (e.g. running from sv08-print-tools repo)
+    def speed_time_ratio(speed_factor, alpha):
+        S = max(speed_factor, 0.1)
+        a = max(alpha, 0.001)
+        return (1.0 / S + a * S) / (1.0 + a)
 
-    For a print with geometry complexity alpha at speed factor S:
-        R(S) = (1/S + α·S) / (1 + α)
+    def optimal_speed_factor(alpha):
+        if alpha <= 0.001:
+            return 10.0
+        return min(1.0 / math.sqrt(alpha), 10.0)
 
-    Returns < 1.0 if speed factor helps, > 1.0 if it hurts.
-    When α > 1/S, increasing speed makes the print SLOWER because the
-    extra acceleration overhead exceeds the cruise time savings.
-    """
-    S = max(speed_factor, 0.1)
-    a = max(alpha, 0.001)
-    return (1.0 / S + a * S) / (1.0 + a)
-
-
-def alpha_from_measurement(effective_speed, speed_factor):
-    """Back-calculate geometry complexity α from measured effective speed.
-
-    Given effective_speed = T_slicer(1x) / T_actual at speed factor S:
-        α = (1 - eff/S) / (eff·S - 1)
-
-    Only works when speed_factor > 1 (at S=1, α cancels out of the
-    time ratio formula, so it can't be determined).
-    Returns None if speed_factor ≈ 1 or data is insufficient.
-    """
-    S = speed_factor
-    if S <= 1.05 or effective_speed <= 0:
-        return None
-
-    denom = effective_speed * S - 1.0
-    if denom <= 0.01:
-        # effective_speed * S ≈ 1 means print is heavily accel-limited
-        return 1.5
-
-    numer = 1.0 - effective_speed / S
-    alpha = numer / denom
-    return max(0.0, min(alpha, 5.0))
-
-
-def optimal_speed_factor(alpha):
-    """Speed factor that minimises print time for this geometry.
-
-    S_optimal = 1/√α. Beyond this, extra speed makes the print slower.
-    Returns the optimal multiplier (e.g. 1.35 means 135%).
-    """
-    if alpha <= 0.001:
-        return 10.0
-    return min(1.0 / math.sqrt(alpha), 10.0)
+    def alpha_from_measurement(effective_speed, speed_factor):
+        S = speed_factor
+        if S <= 1.05 or effective_speed <= 0:
+            return None
+        denom = effective_speed * S - 1.0
+        if denom <= 0.01:
+            return 1.5
+        numer = 1.0 - effective_speed / S
+        return max(0.0, min(numer / denom, 5.0))
 
 
 def speed_factor_benefit(speed_factor, alpha):
     """Human-readable summary of speed factor impact.
 
-    Returns (time_pct, description) where time_pct is the predicted
-    percentage of baseline time (e.g. 85 means 15% faster).
+    Returns (time_pct, description, optimal_pct).
     """
     ratio = speed_time_ratio(speed_factor, alpha)
     pct = round(ratio * 100)
@@ -132,28 +116,59 @@ def speed_factor_benefit(speed_factor, alpha):
 
 # ── Alpha persistence ──────────────────────────────────────────
 
-def _load_alpha_state():
-    """Load persisted alpha measurement for the current print."""
-    if os.path.exists(ALPHA_FILE):
+def _alpha_file(printer="sovol"):
+    """Return per-printer alpha file path."""
+    return os.path.join(TRACKER_DIR, f"current_alpha_{printer}.json")
+
+
+def _load_alpha_state(printer="sovol"):
+    """Load persisted alpha measurement for the current print.
+
+    Uses per-printer file (current_alpha_{printer}.json). Falls back to
+    the legacy current_alpha.json if per-printer file doesn't exist yet
+    (one-time migration).
+    """
+    pfile = _alpha_file(printer)
+    if os.path.exists(pfile):
         try:
-            with open(ALPHA_FILE) as f:
+            with open(pfile) as f:
                 return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Migrate from legacy single-file if it exists
+    if os.path.exists(ALPHA_FILE_LEGACY):
+        try:
+            with open(ALPHA_FILE_LEGACY) as f:
+                data = json.load(f)
+            # Save to per-printer file so we don't migrate again
+            _save_alpha_state(data, printer)
+            return data
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
-def _save_alpha_state(state):
-    """Persist alpha measurement for the current print."""
-    with open(ALPHA_FILE, "w") as f:
+def _save_alpha_state(state, printer="sovol"):
+    """Persist alpha measurement for the current print (per-printer).
+
+    Uses write-to-temp + rename for crash safety — a crash mid-write
+    won't corrupt the existing file.
+    """
+    path = _alpha_file(printer)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
 
 
 # ── Main ETA calculator ───────────────────────────────────────
 
 def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                   speed_factor, live_velocity=0, commanded_speed=0,
-                  current_layer=0, total_layers=0, filename=""):
+                  current_layer=0, total_layers=0, filename="",
+                  printer="sovol"):
     """Calculate smart ETA for a running print.
 
     Returns dict with:
@@ -171,7 +186,7 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
 
     # Load persisted alpha — prefer same filename, but use any recent stored
     # alpha if no filename match (e.g. old data before filename was saved)
-    alpha_state = _load_alpha_state()
+    alpha_state = _load_alpha_state(printer)
     stored_alpha = None
     if alpha_state.get("filename") == filename and filename:
         stored_alpha = alpha_state.get("alpha")
@@ -213,7 +228,7 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                 "effective_speed": round(effective_speed, 3),
                 "filename": filename,
                 "timestamp": datetime.now().isoformat(),
-            })
+            }, printer)
         elif stored_alpha is not None:
             alpha = stored_alpha
         else:
@@ -258,20 +273,11 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                         layer_span = 1.0 / total_layers if total_layers > 0 else 1.0
                         pil = max(0.1, min(0.9,
                             (actual_frac - expected_layer_frac) / layer_span))
-                    # Pass max_speed_pct so ETA matches auto-speed cap
-                    try:
-                        from gcode_profile import load_auto_speed
-                        _auto = load_auto_speed()
-                        _max_spd = (_auto.get("max_speed_pct", 200)
-                                    if _auto.get("enabled") else None)
-                    except Exception:
-                        _max_spd = None
                     profile_remaining = calibrated_eta_remaining(
                         cal, current_layer, pil,
-                        speed_factor=speed_factor,
-                        max_speed_pct=_max_spd)
+                        speed_factor=speed_factor)
         except Exception:
-            pass
+            log.debug("suppressed", exc_info=True)
 
         if profile_remaining and profile_remaining > 0:
             # Profile available — use it directly, no blending
@@ -314,7 +320,7 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                 current_layer=current_layer,
             )
         except Exception:
-            pass
+            log.debug("suppressed", exc_info=True)
 
         # Confidence
         if profile_remaining and profile_remaining > 0:
@@ -381,6 +387,8 @@ def log_snapshot(print_data):
 
     with open(TRACKER_FILE, "a") as f:
         f.write(json.dumps(snapshot) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
     # Per-layer log: track layer transitions for actual vs predicted analysis
     _log_layer_transition(print_data)
@@ -494,8 +502,10 @@ def _log_layer_transition(print_data):
         try:
             with open(LAYER_LOG_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         except Exception:
-            pass
+            log.debug("suppressed", exc_info=True)
 
     _last_logged_layer = {"layer": cur, "elapsed": elapsed, "filename": filename}
 
@@ -586,7 +596,7 @@ def _generate_print_summary(job_data):
                 })
             summary["profile_per_layer"] = layer_profiles
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     # Load layer log for actual per-layer times
     try:
@@ -624,7 +634,7 @@ def _generate_print_summary(job_data):
                         "max_underestimate_pct": round(min(errors), 1),
                     }
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     # Load tracker data for speed history
     try:
@@ -648,7 +658,7 @@ def _generate_print_summary(job_data):
             summary["speed_history_count"] = len(speed_history)
             summary["speed_history"] = speed_history
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
     # Save summary
     safe_name = filename.replace("/", "_").replace(" ", "_")[:80]
@@ -658,7 +668,7 @@ def _generate_print_summary(job_data):
         with open(summary_file, "w") as f:
             json.dump(summary, f, indent=2)
     except Exception:
-        pass
+        log.debug("suppressed", exc_info=True)
 
 
 def get_correction_factor():
