@@ -45,6 +45,15 @@ def _fetch_url(url, timeout=5, retries=3, backoff=1.0):
 OUTPUT_DIR = "/tmp/printer_status"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# When run through a symlink, Python resolves the real path and sets sys.path[0]
+# to the repo directory. printer_config.py lives in the parent dir (alongside the
+# symlink), so we need to add that to sys.path for the import to succeed.
+_real_dir = os.path.dirname(os.path.realpath(__file__))
+_parent_dir = os.path.dirname(_real_dir)
+if (os.path.isfile(os.path.join(_parent_dir, "printer_config.py"))
+        and _parent_dir not in sys.path):
+    sys.path.insert(0, _parent_dir)
+
 try:
     from printer_config import (SOVOL_IP, SOVOL_WIFI_IP, SOVOL_CAMERA_PORT,
                                 MOONRAKER_PORT, BAMBU_IP, BAMBU_SERIAL,
