@@ -154,7 +154,7 @@ def fetch_sovol():
     info = ps.get("info", {})
     result["current_layer"] = info.get("current_layer", 0)
     result["total_layers"] = info.get("total_layer", 0)
-    if result["total_layers"] and result["total_layers"] > 0:
+    if result["total_layers"] > 0:
         result["layer_progress"] = round(result["current_layer"] / result["total_layers"] * 100, 1)
 
     # Speed factor and live velocity
@@ -404,17 +404,9 @@ def fetch_sovol():
                             / (1.0 / total_layers) if total_layers > 0 else 0.5
                         ))
 
-                    # Pass max_speed_pct so ETA matches what
-                    # auto-speed will actually set on future layers
-                    try:
-                        _auto = load_auto_speed()
-                        _max_spd = (_auto.get("max_speed_pct", 200)
-                                    if _auto.get("enabled") else None)
-                    except Exception:
-                        _max_spd = None
                     cal_remaining = calibrated_eta_remaining(
                         cal, cur_layer, progress_in_layer,
-                        speed_factor=spd, max_speed_pct=_max_spd)
+                        speed_factor=spd)
                     if cal_remaining > 0:
                         from datetime import timedelta as td
                         cal_eta = datetime.now() + td(seconds=cal_remaining)
@@ -454,11 +446,19 @@ def fetch_sovol():
                                 target_pct = max(round(target_pct * 0.95),
                                     auto_cfg.get("min_speed_pct", 80))
 
-                            # Clamp to min/max bounds only.
-                            # Per-layer profile alphas are more accurate
-                            # than the global measured alpha, so we trust
-                            # the profile and rely on max_speed_pct as
-                            # the quality ceiling.
+                            # Hard cap: never exceed global optimal from
+                            # measured alpha. Per-layer calibration can
+                            # underestimate complexity; the global
+                            # measurement is ground truth.
+                            try:
+                                from print_eta import optimal_speed_factor
+                                global_opt_pct = round(
+                                    optimal_speed_factor(measured_alpha) * 100)
+                                target_pct = min(target_pct, global_opt_pct)
+                            except Exception:
+                                pass
+
+                            # Clamp
                             target_pct = max(
                                 auto_cfg.get("min_speed_pct", 80),
                                 min(target_pct,
@@ -557,8 +557,7 @@ def fetch_sovol():
     try:
         from gcode_profile import load_profile
         cur_layer = result.get("current_layer", 0)
-        fname = result.get("filename", "")
-        profile = load_profile(fname)
+        profile = load_profile(result.get("filename", ""))
         if profile and profile.get("layers"):
             speed_graph = []
             for layer in profile["layers"]:
@@ -575,28 +574,6 @@ def fetch_sovol():
                     entry["status"] = "future"
                 speed_graph.append(entry)
             result["speed_graph"] = speed_graph
-        elif fname and result.get("state", "").lower() == "printing":
-            # No profile for this print — auto-trigger analysis in background
-            import subprocess, threading
-            lock_file = os.path.join(OUTPUT_DIR, ".profile_generating")
-            if not os.path.exists(lock_file):
-                def _bg_profile():
-                    try:
-                        with open(lock_file, "w") as lf:
-                            lf.write(fname)
-                        script = os.path.join(os.path.dirname(__file__),
-                                              "gcode_profile.py")
-                        subprocess.run(
-                            [sys.executable, script],
-                            timeout=600, capture_output=True)
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            os.unlink(lock_file)
-                        except OSError:
-                            pass
-                threading.Thread(target=_bg_profile, daemon=True).start()
     except Exception:
         pass
 
@@ -827,9 +804,90 @@ def fetch_bambu():
         }
         _save_eta_snapshot(snap_result)
 
-    # ── Frontend display fields for Bambu ──
-    if os.path.exists(os.path.join(OUTPUT_DIR, "a1_camera.jpg")):
-        result["has_camera"] = True
+    # ── Bambu A1 camera snapshot via FTPS ──
+    # Only capture when printing — idle printer has no new recordings
+    bambu_printing = result.get("state", "").lower() in ("printing", "running", "prepare")
+    try:
+        import ftplib
+        import socket
+        import subprocess
+        import io
+
+        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        if not bambu_printing:
+            if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
+                result["has_camera"] = True
+            raise StopIteration("not printing")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        # Implicit FTPS on port 990
+        raw_sock = socket.create_connection((BAMBU_IP, 990), timeout=10)
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=BAMBU_IP)
+        ftp = ftplib.FTP()
+        ftp.af = socket.AF_INET
+        ftp.sock = tls_sock
+        ftp.file = tls_sock.makefile('r', encoding='utf-8', errors='replace')
+        ftp.welcome = ftp.getresp()
+        ftp.login('bblp', BAMBU_ACCESS_CODE)
+
+        # Wrap data connections in TLS too
+        _orig_ntransfercmd = ftp.ntransfercmd
+        def _tls_ntransfercmd(cmd, rest=None):
+            conn, size = _orig_ntransfercmd(cmd, rest)
+            conn = ctx.wrap_socket(conn, server_hostname=BAMBU_IP)
+            return conn, size
+        ftp.ntransfercmd = _tls_ntransfercmd
+        ftp.voidcmd('PBSZ 0')
+        ftp.voidcmd('PROT P')
+
+        ftp.cwd('/ipcam')
+        listing = []
+        ftp.retrlines('NLST', listing.append)
+        avis = sorted([f for f in listing if f.endswith('.avi')])
+
+        if avis:
+            latest_avi = avis[-1]
+            buf = io.BytesIO()
+            max_dl = 2 * 1024 * 1024  # 2MB is enough for a frame
+            dl_count = [0]
+            def _cb(data):
+                if dl_count[0] < max_dl:
+                    buf.write(data)
+                    dl_count[0] += len(data)
+                    if dl_count[0] >= max_dl:
+                        raise EOFError
+            try:
+                ftp.retrbinary('RETR ' + latest_avi, _cb)
+            except (EOFError, Exception):
+                pass
+
+            if buf.tell() > 0:
+                tmp = os.path.join(OUTPUT_DIR, ".a1_partial.avi")
+                with open(tmp, 'wb') as tf:
+                    tf.write(buf.getvalue())
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', tmp, '-vf', 'select=gte(n\\,0)',
+                     '-vframes', '1', '-q:v', '2', cam_path],
+                    capture_output=True, timeout=10)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+        if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
+            result["has_camera"] = True
+    except (StopIteration, Exception):
+        # StopIteration = not printing (skip FTPS), Exception = capture failed
+        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
+            result["has_camera"] = True
 
     # Bambu ETA history — use snapshot_ts for elapsed_h (monotonic)
     try:
@@ -858,15 +916,6 @@ def fetch_bambu():
                             })
                     except Exception:
                         continue
-            # Detect reprints: if progress drops by >20%, a new run started.
-            # Only keep snapshots from the latest run.
-            if eta_history:
-                latest_run_start = 0
-                for i in range(1, len(eta_history)):
-                    if eta_history[i]["progress"] < eta_history[i - 1]["progress"] - 20:
-                        latest_run_start = i
-                eta_history = eta_history[latest_run_start:]
-
             if len(eta_history) >= 2:
                 first_ts = eta_history[0]["snapshot_ts"]
                 for entry in eta_history:
