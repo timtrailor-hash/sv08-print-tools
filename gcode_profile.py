@@ -230,8 +230,14 @@ def calibrate_profile(profile, measured_alpha, current_layer,
     1. Alpha calibration: raw gcode alphas → scaled to match measured alpha
     2. Time calibration: raw time_1x_s → scaled to match actual elapsed time
 
+    IMPORTANT: time_cal_factor is computed using the SAME per-layer formula
+    (optimal speed at calibrated alpha) that predictions use.  This ensures
+    the factor is self-consistent — it corrects for systematic model error,
+    not formula mismatch.
+
     Returns a list of dicts: [{layer, calibrated_alpha, optimal_speed_pct,
-                                time_calibrated_s}, ...]
+                                time_calibrated_s, move_calibrated_s,
+                                fixed_calibrated_s}, ...]
     """
     if not profile or not profile.get("layers"):
         return []
@@ -240,16 +246,12 @@ def calibrate_profile(profile, measured_alpha, current_layer,
     # (weighted by time_1x to give more weight to longer layers)
     total_weight = 0.0
     weighted_sum = 0.0
-    profile_move_elapsed = 0.0
-    profile_fixed_elapsed = 0.0
     for l in profile["layers"]:
         if l["layer"] > current_layer:
             break
         w = l.get("time_1x_s", 1.0)
         weighted_sum += l.get("raw_alpha", l.get("alpha", 1.0)) * w
         total_weight += w
-        profile_move_elapsed += l.get("move_time_s", l.get("time_1x_s", 0))
-        profile_fixed_elapsed += l.get("fixed_overhead_s", 0)
 
     if total_weight < 1.0 or weighted_sum < 0.01:
         return []
@@ -260,17 +262,25 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
     alpha_cal = measured_alpha / avg_raw
 
-    # Time calibration — only move time scales with speed factor
+    # Time calibration — self-consistent with the prediction formula.
+    # Sum per-layer predictions (at each layer's optimal speed with its
+    # calibrated alpha) for elapsed layers, then compare to actual elapsed.
     time_cal_factor = 1.0
-    profile_elapsed = profile_move_elapsed + profile_fixed_elapsed
-    if elapsed_time_s > 60 and profile_elapsed > 60:
-        S = max(speed_factor, 0.1)
-        predicted_elapsed = (
-            profile_move_elapsed * (
-                (1.0 / S + measured_alpha * S) / (1.0 + measured_alpha))
-            + profile_fixed_elapsed)
-        time_cal_factor = elapsed_time_s / predicted_elapsed
-        time_cal_factor = max(0.3, min(time_cal_factor, 3.0))
+    if elapsed_time_s > 60:
+        predicted_elapsed = 0.0
+        for l in profile["layers"]:
+            if l["layer"] > current_layer:
+                break
+            raw_a = l.get("raw_alpha", l.get("alpha", 1.0))
+            cal_a = max(0.01, min(raw_a * alpha_cal, 5.0))
+            opt = optimal_speed(cal_a)
+            ratio = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+            move_t = l.get("move_time_s", l.get("time_1x_s", 0))
+            fixed_t = l.get("fixed_overhead_s", 0)
+            predicted_elapsed += move_t * ratio + fixed_t
+        if predicted_elapsed > 60:
+            time_cal_factor = elapsed_time_s / predicted_elapsed
+            time_cal_factor = max(0.3, min(time_cal_factor, 3.0))
 
     # Apply calibration to all layers
     calibrated = []
@@ -284,7 +294,9 @@ def calibrate_profile(profile, measured_alpha, current_layer,
         # Only apply speed ratio to move time, not fixed overhead
         move_t = l.get("move_time_s", l.get("time_1x_s", 0))
         fixed_t = l.get("fixed_overhead_s", 0)
-        time_cal = (move_t * ratio + fixed_t) * time_cal_factor
+        move_cal = move_t * ratio * time_cal_factor
+        fixed_cal = fixed_t * time_cal_factor
+        time_cal = move_cal + fixed_cal
 
         calibrated.append({
             "layer": l["layer"],
@@ -292,6 +304,8 @@ def calibrate_profile(profile, measured_alpha, current_layer,
             "calibrated_alpha": round(cal_a, 4),
             "optimal_speed_pct": opt_pct,
             "time_calibrated_s": round(time_cal, 1),
+            "move_calibrated_s": round(move_cal, 1),
+            "fixed_calibrated_s": round(fixed_cal, 1),
             "move_time_s": move_t,
             "fixed_overhead_s": fixed_t,
             "time_1x_s": l.get("time_1x_s", 0),
@@ -316,8 +330,9 @@ def calibrated_eta_remaining(calibrated_layers, current_layer,
 
         cal_a = l["calibrated_alpha"]
         opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
-        fixed_t = l.get("fixed_overhead_s", 0)
-        move_cal = l["time_calibrated_s"] - fixed_t
+        # Use properly calibrated move/fixed (both include time_cal_factor)
+        move_cal = l.get("move_calibrated_s", l["time_calibrated_s"])
+        fixed_cal = l.get("fixed_calibrated_s", 0)
         R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
 
         if l["layer"] == current_layer and speed_factor is not None:
@@ -326,7 +341,7 @@ def calibrated_eta_remaining(calibrated_layers, current_layer,
             R_actual = (1.0 / S + cal_a * S) / (1.0 + cal_a)
             actual_move = (move_cal * R_actual / R_optimal
                            if R_optimal > 0.001 else move_cal)
-            remaining += (actual_move + fixed_t) * (1.0 - progress_in_layer)
+            remaining += (actual_move + fixed_cal) * (1.0 - progress_in_layer)
         elif l["layer"] == current_layer:
             remaining += l["time_calibrated_s"] * (1.0 - progress_in_layer)
         else:
@@ -336,7 +351,7 @@ def calibrated_eta_remaining(calibrated_layers, current_layer,
                 R_capped = (1.0 / capped_S + cal_a * capped_S) / (1.0 + cal_a)
                 capped_move = (move_cal * R_capped / R_optimal
                                if R_optimal > 0.001 else move_cal)
-                remaining += capped_move + fixed_t
+                remaining += capped_move + fixed_cal
             else:
                 remaining += l["time_calibrated_s"]
     return remaining
