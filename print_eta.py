@@ -258,9 +258,18 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                         layer_span = 1.0 / total_layers if total_layers > 0 else 1.0
                         pil = max(0.1, min(0.9,
                             (actual_frac - expected_layer_frac) / layer_span))
+                    # Pass max_speed_pct so ETA matches auto-speed cap
+                    try:
+                        from gcode_profile import load_auto_speed
+                        _auto = load_auto_speed()
+                        _max_spd = (_auto.get("max_speed_pct", 200)
+                                    if _auto.get("enabled") else None)
+                    except Exception:
+                        _max_spd = None
                     profile_remaining = calibrated_eta_remaining(
                         cal, current_layer, pil,
-                        speed_factor=speed_factor)
+                        speed_factor=speed_factor,
+                        max_speed_pct=_max_spd)
         except Exception:
             pass
 

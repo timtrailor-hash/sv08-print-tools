@@ -27,7 +27,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from config import MOONRAKER_URL as MOONRAKER
+try:
+    from printer_config import SOVOL_IP, MOONRAKER_PORT
+except ImportError:
+    SOVOL_IP = "[REDACTED — see printer_config.example.py]"
+    MOONRAKER_PORT = 7125
+MOONRAKER = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
 PROFILE_DIR = "/tmp/printer_status"
 PROFILE_FILE = os.path.join(PROFILE_DIR, "gcode_profile.json")
 AUTO_SPEED_FILE = os.path.join(PROFILE_DIR, "auto_speed.json")
@@ -296,35 +301,44 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
 
 def calibrated_eta_remaining(calibrated_layers, current_layer,
-                             progress_in_layer=0.5, speed_factor=None):
+                             progress_in_layer=0.5, speed_factor=None,
+                             max_speed_pct=None):
     """Calculate remaining time from calibrated layer data.
 
     Current layer uses actual speed_factor (since auto-speed can't adjust
-    mid-layer). Future layers use their pre-computed optimal-speed times
-    (auto-speed will set them there on layer change).
+    mid-layer). Future layers use min(optimal, max_speed_pct) to match
+    what auto-speed will actually set.
     """
     remaining = 0.0
     for l in calibrated_layers:
         if l["layer"] < current_layer:
             continue
-        elif l["layer"] == current_layer and speed_factor is not None:
-            # Current layer: recalculate move time at actual speed, not optimal
-            cal_a = l["calibrated_alpha"]
+
+        cal_a = l["calibrated_alpha"]
+        opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
+        fixed_t = l.get("fixed_overhead_s", 0)
+        move_cal = l["time_calibrated_s"] - fixed_t
+        R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
+
+        if l["layer"] == current_layer and speed_factor is not None:
+            # Current layer: use actual speed (can't change mid-layer)
             S = max(speed_factor, 0.1)
-            opt = 1.0 / math.sqrt(cal_a) if cal_a > 0.001 else 10.0
             R_actual = (1.0 / S + cal_a * S) / (1.0 + cal_a)
-            R_optimal = (1.0 / opt + cal_a * opt) / (1.0 + cal_a)
-            # Split: only move portion scales with speed ratio
-            fixed_t = l.get("fixed_overhead_s", 0)
-            move_cal = l["time_calibrated_s"] - fixed_t
             actual_move = (move_cal * R_actual / R_optimal
                            if R_optimal > 0.001 else move_cal)
-            actual_time = actual_move + fixed_t
-            remaining += actual_time * (1.0 - progress_in_layer)
+            remaining += (actual_move + fixed_t) * (1.0 - progress_in_layer)
         elif l["layer"] == current_layer:
             remaining += l["time_calibrated_s"] * (1.0 - progress_in_layer)
         else:
-            remaining += l["time_calibrated_s"]
+            # Future layer: cap speed at max_speed_pct if set
+            if max_speed_pct and l["optimal_speed_pct"] > max_speed_pct:
+                capped_S = max_speed_pct / 100.0
+                R_capped = (1.0 / capped_S + cal_a * capped_S) / (1.0 + cal_a)
+                capped_move = (move_cal * R_capped / R_optimal
+                               if R_optimal > 0.001 else move_cal)
+                remaining += capped_move + fixed_t
+            else:
+                remaining += l["time_calibrated_s"]
     return remaining
 
 

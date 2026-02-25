@@ -33,8 +33,8 @@ import os
 from datetime import datetime
 
 # Persistent storage (survives reboots, accumulates across prints)
-LEARN_DIR = os.environ.get("PRINTER_LEARN_DIR",
-    os.path.expanduser("~/.printer_learning"))
+LEARN_DIR = os.path.expanduser(
+    "~/Documents/Claude code/printer_learning")
 os.makedirs(LEARN_DIR, exist_ok=True)
 
 ACCURACY_FILE = os.path.join(LEARN_DIR, "completed_accuracy.json")
