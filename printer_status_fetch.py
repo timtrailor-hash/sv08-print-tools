@@ -689,13 +689,15 @@ def fetch_sovol():
                     except Exception:
                         continue
             # Detect reprints of same filename: if progress drops
-            # significantly, discard entries from the previous run
+            # significantly, discard entries from the previous run.
+            # A drop of >5 points catches both full completions (99→1)
+            # and short/cancelled runs (e.g. 9→1).
             if len(eta_history) >= 2:
                 last_reset = 0
                 for i in range(1, len(eta_history)):
                     prev_prog = eta_history[i - 1]["progress"]
                     curr_prog = eta_history[i]["progress"]
-                    if prev_prog > 50 and curr_prog < 10:
+                    if curr_prog < prev_prog - 5:
                         last_reset = i
                 if last_reset > 0:
                     eta_history = eta_history[last_reset:]
@@ -1075,13 +1077,15 @@ def fetch_bambu():
                     except Exception:
                         continue
             # Detect reprints of same filename: if progress drops
-            # significantly, discard entries from the previous run
+            # significantly, discard entries from the previous run.
+            # A drop of >5 points catches both full completions (99→1)
+            # and short/cancelled runs (e.g. 9→1).
             if len(eta_history) >= 2:
                 last_reset = 0
                 for i in range(1, len(eta_history)):
                     prev_prog = eta_history[i - 1]["progress"]
                     curr_prog = eta_history[i]["progress"]
-                    if prev_prog > 50 and curr_prog < 10:
+                    if curr_prog < prev_prog - 5:
                         last_reset = i  # New print started here
                 if last_reset > 0:
                     eta_history = eta_history[last_reset:]

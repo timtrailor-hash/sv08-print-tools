@@ -870,20 +870,24 @@ def load_profile(filename=None, max_age_hours=24):
     try:
         with open(PROFILE_FILE) as f:
             profile = json.load(f)
-        if filename and profile.get("filename") != filename:
+        filename_matches = filename and profile.get("filename") == filename
+        if filename and not filename_matches:
             return None
-        # Invalidate stale profiles (e.g. gcode re-sliced with same name)
-        generated = profile.get("generated", "")
-        if generated:
-            try:
-                gen_time = datetime.fromisoformat(generated)
-                age_hours = (datetime.now() - gen_time).total_seconds() / 3600
-                if age_hours > max_age_hours:
-                    log.info("Profile for %s is %.0fh old, invalidating",
-                             profile.get("filename", "?"), age_hours)
-                    return None
-            except (ValueError, TypeError):
-                pass
+        # Invalidate stale profiles (e.g. gcode re-sliced with same name).
+        # Skip age check when the profile matches the active print — long
+        # prints legitimately outlive the 24h window.
+        if not filename_matches:
+            generated = profile.get("generated", "")
+            if generated:
+                try:
+                    gen_time = datetime.fromisoformat(generated)
+                    age_hours = (datetime.now() - gen_time).total_seconds() / 3600
+                    if age_hours > max_age_hours:
+                        log.info("Profile for %s is %.0fh old, invalidating",
+                                 profile.get("filename", "?"), age_hours)
+                        return None
+                except (ValueError, TypeError):
+                    pass
         return profile
     except (json.JSONDecodeError, OSError):
         return None
