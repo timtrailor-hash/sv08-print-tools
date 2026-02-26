@@ -280,26 +280,26 @@ def fetch_sovol():
 
     result["state"] = ps.get("state", "unknown")
     result["filename"] = ps.get("filename", "")
-    result["progress"] = round(ds.get("progress", 0) * 100, 1)
-    result["print_duration"] = ps.get("print_duration", 0)
-    result["total_duration"] = ps.get("total_duration", 0)
-    result["filament_used_mm"] = ps.get("filament_used", 0)
-    result["bed_temp"] = round(bed.get("temperature", 0), 1)
-    result["bed_target"] = round(bed.get("target", 0), 1)
-    result["nozzle_temp"] = round(ext.get("temperature", 0), 1)
-    result["nozzle_target"] = round(ext.get("target", 0), 1)
+    result["progress"] = round((ds.get("progress") or 0) * 100, 1)
+    result["print_duration"] = ps.get("print_duration") or 0
+    result["total_duration"] = ps.get("total_duration") or 0
+    result["filament_used_mm"] = ps.get("filament_used") or 0
+    result["bed_temp"] = round(bed.get("temperature") or 0, 1)
+    result["bed_target"] = round(bed.get("target") or 0, 1)
+    result["nozzle_temp"] = round(ext.get("temperature") or 0, 1)
+    result["nozzle_target"] = round(ext.get("target") or 0, 1)
 
     # Layer progress
     info = ps.get("info", {})
-    result["current_layer"] = info.get("current_layer", 0)
-    result["total_layers"] = info.get("total_layer", 0)
+    result["current_layer"] = info.get("current_layer") or 0
+    result["total_layers"] = info.get("total_layer") or 0
     if result["total_layers"] > 0:
         result["layer_progress"] = round(result["current_layer"] / result["total_layers"] * 100, 1)
 
     # Speed factor and live velocity
-    result["speed_factor"] = gm.get("speed_factor", 1.0)
-    result["commanded_speed"] = round(gm.get("speed", 0) / 60, 1)  # mm/min -> mm/s
-    result["live_velocity"] = round(mr.get("live_velocity", 0), 1)
+    result["speed_factor"] = gm.get("speed_factor") or 1.0
+    result["commanded_speed"] = round((gm.get("speed") or 0) / 60, 1)  # mm/min -> mm/s
+    result["live_velocity"] = round(mr.get("live_velocity") or 0, 1)
 
     # Metadata for current file
     if result["filename"]:
@@ -307,15 +307,15 @@ def fetch_sovol():
         try:
             meta = json.loads(_fetch_url(
                 f"{base}/server/files/metadata?filename={enc}", timeout=5))["result"]
-            result["estimated_time"] = meta.get("estimated_time", 0)
-            result["filament_total_mm"] = meta.get("filament_total", 0)
-            result["filament_weight_g"] = meta.get("filament_weight_total", 0)
+            result["estimated_time"] = meta.get("estimated_time") or 0
+            result["filament_total_mm"] = meta.get("filament_total") or 0
+            result["filament_weight_g"] = meta.get("filament_weight_total") or 0
             result["slicer"] = meta.get("slicer", "")
-            result["layer_height"] = meta.get("layer_height", 0)
-            result["nozzle_diameter"] = meta.get("nozzle_diameter", 0)
+            result["layer_height"] = meta.get("layer_height") or 0
+            result["nozzle_diameter"] = meta.get("nozzle_diameter") or 0
             result["filament_name"] = meta.get("filament_name", "")
             result["filament_type"] = meta.get("filament_type", "")
-            result["object_height"] = meta.get("object_height", 0)
+            result["object_height"] = meta.get("object_height") or 0
 
             # Thumbnail
             thumbs = meta.get("thumbnails", [])
@@ -387,7 +387,7 @@ def fetch_sovol():
             log_snapshot(result)
     except Exception:
         # Fallback to naive calculation
-        if result["progress"] > 0:
+        if (result.get("progress") or 0) > 0:
             actual_total = dur / (result["progress"] / 100)
             remaining = actual_total - dur
             eta = datetime.now() + timedelta(seconds=remaining)
@@ -744,7 +744,7 @@ def fetch_sovol():
 
     # Filament feed monitor — detect stalled extrusion
     # Compare expected filament usage (from progress) vs actual usage
-    if fil_total_m > 0 and result["progress"] > 5 and result.get("state") == "printing":
+    if fil_total_m > 0 and (result.get("progress") or 0) > 5 and result.get("state") == "printing":
         expected_m = fil_total_m * (result["progress"] / 100)
         if expected_m > 0:
             feed_ratio = fil_used_m / expected_m
@@ -860,16 +860,16 @@ def fetch_bambu():
             p = data["print"]
             result["online"] = True
             result["state"] = p.get("gcode_state", "unknown")
-            result["progress"] = p.get("mc_percent", 0)
-            result["remaining_min"] = p.get("mc_remaining_time", 0)
+            result["progress"] = p.get("mc_percent") or 0
+            result["remaining_min"] = p.get("mc_remaining_time") or 0
             result["filename"] = p.get("gcode_file", "")
             result["subtask_name"] = p.get("subtask_name", "")
-            result["layer_num"] = p.get("layer_num", 0)
-            result["total_layer_num"] = p.get("total_layer_num", 0)
-            result["nozzle_temp"] = round(p.get("nozzle_temper", 0), 1)
-            result["nozzle_target"] = round(p.get("nozzle_target_temper", 0), 1)
-            result["bed_temp"] = round(p.get("bed_temper", 0), 1)
-            result["bed_target"] = round(p.get("bed_target_temper", 0), 1)
+            result["layer_num"] = p.get("layer_num") or 0
+            result["total_layer_num"] = p.get("total_layer_num") or 0
+            result["nozzle_temp"] = round(p.get("nozzle_temper") or 0, 1)
+            result["nozzle_target"] = round(p.get("nozzle_target_temper") or 0, 1)
+            result["bed_temp"] = round(p.get("bed_temper") or 0, 1)
+            result["bed_target"] = round(p.get("bed_target_temper") or 0, 1)
             result["speed_level"] = p.get("spd_lvl", 0)
             result["wifi_signal"] = p.get("wifi_signal", "")
             result["print_type"] = p.get("print_type", "")
@@ -890,8 +890,8 @@ def fetch_bambu():
                 result["ams_trays"] = trays
 
             # Calculate times
-            rem = result.get("remaining_min", 0)
-            prog = result.get("progress", 0)
+            rem = result.get("remaining_min") or 0
+            prog = result.get("progress") or 0
             if prog > 0 and prog < 100:
                 total_min = rem / (1 - prog / 100)
                 elapsed_min = total_min - rem
@@ -945,8 +945,8 @@ def fetch_bambu():
     if (result.get("state", "").upper() == "RUNNING" and
             result.get("remaining_str") and result.get("filename")):
         # Build elapsed_s from progress + remaining
-        rem_min = result.get("remaining_min", 0)
-        prog = result.get("progress", 0)
+        rem_min = result.get("remaining_min") or 0
+        prog = result.get("progress") or 0
         elapsed_s = 0
         if prog > 0 and prog < 100:
             total_min = rem_min / (1 - prog / 100)
