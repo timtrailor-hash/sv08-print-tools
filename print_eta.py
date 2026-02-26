@@ -163,6 +163,9 @@ def _save_alpha_state(state, printer="sovol"):
     os.rename(tmp, path)
 
 
+# ── Profile calibration cache (survive transient failures) ────
+_last_valid_cal = {}  # {printer: {"cal": [...], "layer": N, "alpha": X, "speed": S}}
+
 # ── Main ETA calculator ───────────────────────────────────────
 
 def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
@@ -263,8 +266,39 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                                        calibrated_eta_remaining)
             profile = load_profile(filename) if filename else None
             if profile and alpha and current_layer > 0:
-                cal = calibrate_profile(profile, alpha, current_layer, S,
-                                               elapsed_time_s=print_duration_s)
+                cal = None
+                # Try calibration with one retry on transient failure
+                for _attempt in range(2):
+                    try:
+                        cal = calibrate_profile(
+                            profile, alpha, current_layer, S,
+                            elapsed_time_s=print_duration_s)
+                        if cal:
+                            # Cache this valid calibration for fallback
+                            _last_valid_cal[printer] = {
+                                "cal": cal, "layer": current_layer,
+                                "alpha": alpha, "speed": S,
+                            }
+                            break
+                    except Exception:
+                        if _attempt == 0:
+                            import time as _time
+                            _time.sleep(0.3)
+                        else:
+                            log.debug("profile calibration retry failed",
+                                      exc_info=True)
+
+                # Fall back to cached calibration on transient failure
+                if not cal and printer in _last_valid_cal:
+                    cached = _last_valid_cal[printer]
+                    # Only reuse if same print and not too stale (< 50 layers)
+                    if (cached.get("layer", 0) > 0 and
+                            abs(current_layer - cached["layer"]) < 50):
+                        cal = cached["cal"]
+                        log.info("Using cached profile calibration "
+                                 "(layer %d→%d)", cached["layer"],
+                                 current_layer)
+
                 if cal:
                     pil = 0.5
                     if total_layers > 0:

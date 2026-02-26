@@ -71,6 +71,101 @@ except ImportError:
 ETA_SNAPSHOTS_FILE = os.path.join(OUTPUT_DIR, "eta_snapshots.jsonl")
 _SNAPSHOT_INTERVAL_S = 300  # 5 minutes
 
+# ── ETA method change / connection failure alerting ──
+# Tracks last known method per printer so we can detect transitions
+# (e.g. profile → pace+slicer) and write an alert file for the
+# conversation_server to pick up and push to the iOS app.
+ALERT_FILE = os.path.join(OUTPUT_DIR, "printer_alerts.jsonl")
+_prev_eta_method = {}  # {printer_key: "profile(...)" or "pace+slicer(...)"}
+_prev_fetch_ok = {"sovol": True, "bambu": True}  # track connection health
+
+
+def _method_family(method_str):
+    """Extract the method family from a full method string.
+
+    'profile(cal,layers=247,α=0.36)' → 'profile'
+    'pace+slicer(α=0.35)'           → 'pace+slicer'
+    'physics(α=0.40)'               → 'physics'
+    'bambu_mqtt'                     → 'bambu_mqtt'
+    """
+    if not method_str:
+        return ""
+    paren = method_str.find("(")
+    return method_str[:paren] if paren > 0 else method_str
+
+
+def _write_alert(alert_dict):
+    """Append a printer alert to the alert file for conversation_server."""
+    alert_dict["ts"] = datetime.now().isoformat()
+    alert_dict["ts_epoch"] = time.time()
+    try:
+        with open(ALERT_FILE, "a") as f:
+            f.write(json.dumps(alert_dict) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        _log_exc("write_alert")
+
+
+def check_eta_method_change(printer_key, result):
+    """Detect ETA method family changes and write an alert.
+
+    Called after ETA calculation. If the method switches (e.g. profile →
+    pace+slicer), writes an alert that conversation_server broadcasts.
+    """
+    method = result.get("eta_method", "")
+    if not method:
+        return
+    family = _method_family(method)
+    prev = _prev_eta_method.get(printer_key)
+
+    if prev and prev != family:
+        if family in ("pace+slicer", "physics"):
+            # Degraded — profile dropped out
+            msg = (f"{'SV08 Max' if 'sovol' in printer_key else 'Bambu A1'}: "
+                   f"ETA switched from {prev} to {family} — "
+                   f"profile calibration lost, predictions less accurate")
+            event = "eta_method_degraded"
+        else:
+            # Recovered — back to profile
+            msg = (f"{'SV08 Max' if 'sovol' in printer_key else 'Bambu A1'}: "
+                   f"ETA recovered to {family} (was {prev})")
+            event = "eta_method_recovered"
+
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08" if "sovol" in printer_key else "a1",
+            "event": event,
+            "message": msg,
+            "old_method": prev,
+            "new_method": family,
+        })
+
+    _prev_eta_method[printer_key] = family
+
+
+def check_connection_health(printer_key, success, error_msg=""):
+    """Track connection health and alert on failure/recovery."""
+    was_ok = _prev_fetch_ok.get(printer_key, True)
+    name = "SV08 Max" if printer_key == "sovol" else "Bambu A1"
+
+    if was_ok and not success:
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08" if printer_key == "sovol" else "a1",
+            "event": "connection_lost",
+            "message": f"{name}: Connection lost — {error_msg[:100]}",
+        })
+    elif not was_ok and success:
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08" if printer_key == "sovol" else "a1",
+            "event": "connection_restored",
+            "message": f"{name}: Connection restored",
+        })
+
+    _prev_fetch_ok[printer_key] = success
+
 
 def _save_eta_snapshot(result):
     """Save an immutable ETA prediction snapshot every 5 minutes.
@@ -172,6 +267,8 @@ def fetch_sovol():
             continue
     else:
         result["error"] = "unreachable on both ethernet (.52) and wifi (.38)"
+        check_connection_health("sovol", False,
+                                "unreachable on ethernet and wifi")
         return result
 
     ps = data.get("print_stats", {})
@@ -725,6 +822,12 @@ def fetch_sovol():
     except Exception:
         log.debug("suppressed", exc_info=True)
 
+    # ── Connection health + ETA method change alerts ──
+    check_connection_health("sovol", result.get("online", False),
+                            result.get("error", ""))
+    if result.get("state") == "printing":
+        check_eta_method_change("sovol", result)
+
     return result
 
 
@@ -992,6 +1095,10 @@ def fetch_bambu():
                 result["eta_history"] = eta_history
     except Exception:
         log.debug("suppressed", exc_info=True)
+
+    # ── Connection health alerts for Bambu ──
+    check_connection_health("bambu", result.get("online", False),
+                            result.get("error", ""))
 
     return result
 
