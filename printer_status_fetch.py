@@ -591,6 +591,18 @@ def fetch_sovol():
                             })
                     except Exception:
                         continue
+            # Detect reprints of same filename: if progress drops
+            # significantly, discard entries from the previous run
+            if len(eta_history) >= 2:
+                last_reset = 0
+                for i in range(1, len(eta_history)):
+                    prev_prog = eta_history[i - 1]["progress"]
+                    curr_prog = eta_history[i]["progress"]
+                    if prev_prog > 50 and curr_prog < 10:
+                        last_reset = i
+                if last_reset > 0:
+                    eta_history = eta_history[last_reset:]
+
             if len(eta_history) >= 2:
                 result["eta_history"] = eta_history
     except Exception:
@@ -959,6 +971,18 @@ def fetch_bambu():
                             })
                     except Exception:
                         continue
+            # Detect reprints of same filename: if progress drops
+            # significantly, discard entries from the previous run
+            if len(eta_history) >= 2:
+                last_reset = 0
+                for i in range(1, len(eta_history)):
+                    prev_prog = eta_history[i - 1]["progress"]
+                    curr_prog = eta_history[i]["progress"]
+                    if prev_prog > 50 and curr_prog < 10:
+                        last_reset = i  # New print started here
+                if last_reset > 0:
+                    eta_history = eta_history[last_reset:]
+
             if len(eta_history) >= 2:
                 first_ts = eta_history[0]["snapshot_ts"]
                 for entry in eta_history:
