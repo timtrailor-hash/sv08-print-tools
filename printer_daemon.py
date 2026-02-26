@@ -15,7 +15,7 @@ from datetime import datetime
 
 OUTPUT_DIR = "/tmp/printer_status"
 STATUS_FILE = os.path.join(OUTPUT_DIR, "status.json")
-POLL_PRINTING = 30    # seconds between polls when printing
+POLL_PRINTING = 15    # seconds between polls when printing
 POLL_IDLE = 300       # seconds between polls when idle
 ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
 MAX_BACKOFF = 300     # max backoff

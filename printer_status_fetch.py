@@ -1010,7 +1010,7 @@ def fetch_bambu():
         if avis:
             latest_avi = avis[-1]
             buf = io.BytesIO()
-            max_dl = 256 * 1024  # 256KB — enough for one frame, ~8s download
+            max_dl = 128 * 1024  # 128KB — enough for one frame, ~4s download
             dl_count = [0]
             def _cb(data):
                 if dl_count[0] < max_dl:
@@ -1028,7 +1028,8 @@ def fetch_bambu():
                 with open(tmp, 'wb') as tf:
                     tf.write(buf.getvalue())
                 subprocess.run(
-                    ['ffmpeg', '-y', '-i', tmp, '-vf', 'select=gte(n\\,0)',
+                    ['/opt/homebrew/bin/ffmpeg', '-y', '-i', tmp,
+                     '-vf', 'select=gte(n\\,0)',
                      '-vframes', '1', '-q:v', '2', cam_path],
                     capture_output=True, timeout=10)
                 try:
@@ -1043,8 +1044,15 @@ def fetch_bambu():
 
         if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
             result["has_camera"] = True
-    except (StopIteration, Exception):
-        # StopIteration = not printing (skip FTPS), Exception = capture failed
+    except StopIteration:
+        # Not printing — skip FTPS, use cached image
+        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
+            result["has_camera"] = True
+    except Exception as e:
+        # Camera capture failed — log it so we can debug
+        log.warning("Bambu camera capture failed: %s: %s",
+                     type(e).__name__, e)
         cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
         if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
             result["has_camera"] = True
