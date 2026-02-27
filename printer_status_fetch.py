@@ -45,6 +45,11 @@ def _fetch_url(url, timeout=5, retries=3, backoff=1.0):
 OUTPUT_DIR = "/tmp/printer_status"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Persistent directory for immutable data that must survive reboots
+# (eta_snapshots.jsonl, print_tracker.jsonl, print_summaries/)
+PERSISTENT_DIR = os.path.expanduser("~/.local/share/printer")
+os.makedirs(PERSISTENT_DIR, exist_ok=True)
+
 # When run through a symlink, Python resolves the real path and sets sys.path[0]
 # to the repo directory. printer_config.py lives in the parent dir (alongside the
 # symlink), so we need to add that to sys.path for the import to succeed.
@@ -68,7 +73,7 @@ except ImportError:
     BAMBU_ACCESS_CODE = "[REDACTED — see printer_config.example.py]"
     BAMBU_MQTT_PORT = 8883
 
-ETA_SNAPSHOTS_FILE = os.path.join(OUTPUT_DIR, "eta_snapshots.jsonl")
+ETA_SNAPSHOTS_FILE = os.path.join(PERSISTENT_DIR, "eta_snapshots.jsonl")
 _SNAPSHOT_INTERVAL_S = 300  # 5 minutes
 
 # ── ETA method change / connection failure alerting ──
@@ -663,7 +668,7 @@ def fetch_sovol():
 
     # ETA history from immutable snapshots (for drift graph)
     try:
-        snap_path = os.path.join(OUTPUT_DIR, "eta_snapshots.jsonl")
+        snap_path = ETA_SNAPSHOTS_FILE
         cur_file = result.get("filename", "")
         if os.path.exists(snap_path) and cur_file:
             eta_history = []
@@ -1059,7 +1064,7 @@ def fetch_bambu():
 
     # Bambu ETA history — use snapshot_ts for elapsed_h (monotonic)
     try:
-        snap_path = os.path.join(OUTPUT_DIR, "eta_snapshots.jsonl")
+        snap_path = ETA_SNAPSHOTS_FILE
         cur_file = result.get("filename", "")
         if os.path.exists(snap_path) and cur_file:
             eta_history = []
