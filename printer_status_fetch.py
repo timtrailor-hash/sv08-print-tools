@@ -1,5 +1,11 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.11
 """Fetch live status from both printers and save images/data for inline display."""
+
+# Re-exec under the correct Python if invoked via system python (missing paho-mqtt etc.)
+import sys as _sys, os as _os
+_PREFERRED = "/opt/homebrew/bin/python3.11"
+if _sys.version_info < (3, 10) and _os.path.exists(_PREFERRED):
+    _os.execv(_PREFERRED, [_PREFERRED] + _sys.argv)
 
 import json
 import logging
@@ -707,6 +713,17 @@ def fetch_sovol():
                 if last_reset > 0:
                     eta_history = eta_history[last_reset:]
 
+            # Smooth sawtooth: within a progress level, ETA drifts
+            # upward because progress stagnates between layer changes.
+            # Keep only the LAST entry per progress level to eliminate
+            # within-layer drift, giving one clean data point per %.
+            if len(eta_history) >= 2:
+                by_prog = {}
+                for entry in eta_history:
+                    by_prog[entry["progress"]] = entry  # last wins
+                eta_history = sorted(by_prog.values(),
+                                     key=lambda e: e["elapsed_h"])
+
             if len(eta_history) >= 2:
                 result["eta_history"] = eta_history
     except Exception:
@@ -1102,6 +1119,14 @@ def fetch_bambu():
                         last_reset = i  # New print started here
                 if last_reset > 0:
                     eta_history = eta_history[last_reset:]
+
+            # Smooth sawtooth: keep only last entry per progress level
+            if len(eta_history) >= 2:
+                by_prog = {}
+                for entry in eta_history:
+                    by_prog[entry["progress"]] = entry
+                eta_history = sorted(by_prog.values(),
+                                     key=lambda e: e["snapshot_ts"])
 
             if len(eta_history) >= 2:
                 first_ts = eta_history[0]["snapshot_ts"]
