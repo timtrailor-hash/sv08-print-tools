@@ -28,6 +28,15 @@ POLL_IDLE = 300       # seconds between polls when idle
 ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
 MAX_BACKOFF = 300     # max backoff
 
+# Auto-recovery constants
+MAX_RECOVERY_ATTEMPTS = 3       # per print job
+RECOVERY_SETTLE_S = 10          # wait for Klipper to settle after crash
+RECOVERY_RECONNECT_S = 30       # wait for Klipper to reconnect after FIRMWARE_RESTART
+
+# CPU/thermal alert thresholds
+CPU_LOAD_WARN = 1.2
+CPU_TEMP_WARN = 70.0  # °C
+
 # Auto-profiling state
 _last_profiled_file = None
 _profiling_in_progress = False
@@ -38,6 +47,15 @@ _last_saved_var_check = 0
 
 # Error alerting state
 _last_alerted_state = {"sv08": None, "a1": None}
+
+# Auto-recovery state
+_recovery_attempts = 0
+_last_print_file = None           # reset recovery counter on new print
+_recovery_in_progress = False
+
+# CPU/thermal monitoring state
+_last_cpu_alert_time = 0
+_CPU_ALERT_COOLDOWN = 300  # don't re-alert within 5 min
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -181,6 +199,94 @@ def _write_alert(alert_dict):
         sys.stdout.flush()
 
 
+def _get_moonraker_base():
+    """Return the Moonraker base URL for the SV08."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from printer_config import SOVOL_IP, MOONRAKER_PORT
+        return f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+    except ImportError:
+        return None
+
+
+def _moonraker_post(path, data=None, timeout=10):
+    """Send a POST request to Moonraker. Returns response dict or None."""
+    base = _get_moonraker_base()
+    if not base:
+        return None
+    url = f"{base}{path}"
+    body = json.dumps(data).encode() if data else b""
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] MOONRAKER POST {path} failed: {e}")
+        sys.stdout.flush()
+        return None
+
+
+def _moonraker_get(path, timeout=5):
+    """Send a GET request to Moonraker. Returns response dict or None."""
+    base = _get_moonraker_base()
+    if not base:
+        return None
+    url = f"{base}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _check_cpu_thermal():
+    """Query Moonraker for host CPU load and temperature, alert if high.
+
+    Uses /machine/proc_stats which returns cpu_temp and moonraker_stats
+    with per-sample cpu_usage percentages. We derive sysload from the
+    latest sample's cpu_usage (0-100%) and the cpu count.
+    """
+    global _last_cpu_alert_time
+    now = time.time()
+
+    proc = _moonraker_get("/machine/proc_stats")
+    if not proc:
+        return
+    result = proc.get("result", {})
+    cpu_temp = result.get("cpu_temp", 0)
+
+    # Derive sysload from moonraker_stats cpu_usage percentage
+    sysload = 0
+    cpu_count = result.get("system_info", {}).get("cpu_info", {}).get("cpu_count", 4)
+    ms = result.get("moonraker_stats", [])
+    if ms:
+        # cpu_usage is 0-100% across all cores; convert to load-average-like number
+        sysload = ms[-1].get("cpu_usage", 0) / 100.0 * cpu_count
+
+    alerts = []
+    if sysload > CPU_LOAD_WARN:
+        alerts.append(f"sysload={sysload:.2f} (>{CPU_LOAD_WARN})")
+    if cpu_temp > CPU_TEMP_WARN:
+        alerts.append(f"cpu_temp={cpu_temp:.1f}°C (>{CPU_TEMP_WARN}°C)")
+
+    if alerts and (now - _last_cpu_alert_time > _CPU_ALERT_COOLDOWN):
+        _last_cpu_alert_time = now
+        msg = f"SV08 HOST WARNING: {', '.join(alerts)}"
+        print(f"[{datetime.now().isoformat()}] {msg}")
+        sys.stdout.flush()
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08",
+            "event": "cpu_thermal_warning",
+            "message": msg,
+            "sysload": sysload,
+            "cpu_temp": cpu_temp,
+        })
+
+
 def _validate_saved_variables():
     """Check saved_variables.cfg for corruption before Klipper does.
 
@@ -259,12 +365,104 @@ def _validate_saved_variables():
     _write_alert(alert)
 
 
+def _attempt_recovery():
+    """Attempt auto-recovery after a Klipper crash/shutdown.
+
+    Sequence: wait → FIRMWARE_RESTART → verify ready → reheat bed → alert.
+    Returns True if recovery succeeded, False otherwise.
+    """
+    global _recovery_attempts, _recovery_in_progress
+    _recovery_in_progress = True
+
+    try:
+        _recovery_attempts += 1
+        attempt = _recovery_attempts
+        print(f"[{datetime.now().isoformat()}] RECOVERY: attempt {attempt}/{MAX_RECOVERY_ATTEMPTS}")
+        sys.stdout.flush()
+
+        # Step 1: Wait for Klipper to settle
+        print(f"[{datetime.now().isoformat()}] RECOVERY: waiting {RECOVERY_SETTLE_S}s for Klipper to settle")
+        sys.stdout.flush()
+        time.sleep(RECOVERY_SETTLE_S)
+
+        # Step 2: Send FIRMWARE_RESTART
+        print(f"[{datetime.now().isoformat()}] RECOVERY: sending FIRMWARE_RESTART")
+        sys.stdout.flush()
+        result = _moonraker_post("/printer/firmware_restart")
+        if result is None:
+            print(f"[{datetime.now().isoformat()}] RECOVERY: FIRMWARE_RESTART failed — Moonraker unreachable")
+            sys.stdout.flush()
+            return False
+
+        # Step 3: Wait for Klipper to reconnect
+        print(f"[{datetime.now().isoformat()}] RECOVERY: waiting {RECOVERY_RECONNECT_S}s for reconnect")
+        sys.stdout.flush()
+        time.sleep(RECOVERY_RECONNECT_S)
+
+        # Step 4: Verify Klipper state is 'ready'
+        info = _moonraker_get("/printer/info")
+        if not info:
+            print(f"[{datetime.now().isoformat()}] RECOVERY: cannot reach Moonraker after restart")
+            sys.stdout.flush()
+            return False
+
+        state = info.get("result", {}).get("state", "unknown")
+        if state != "ready":
+            print(f"[{datetime.now().isoformat()}] RECOVERY: Klipper state is '{state}', not 'ready'")
+            sys.stdout.flush()
+            return False
+
+        print(f"[{datetime.now().isoformat()}] RECOVERY: Klipper is ready!")
+        sys.stdout.flush()
+
+        # Step 5: Reheat bed from checkpoint
+        bed_temp = 60  # default
+        checkpoint_info = ""
+        try:
+            with open(CHECKPOINT_FILE) as f:
+                cp = json.load(f)
+            bed_temp = int(cp.get("bed_temp", 60)) or 60
+            checkpoint_info = (f"Last checkpoint: {cp.get('progress_pct', 0):.1f}% "
+                             f"(layer {cp.get('current_layer', '?')}/{cp.get('total_layers', '?')}, "
+                             f"Z={cp.get('z_position', '?')}mm, "
+                             f"file={cp.get('filename', '?')})")
+        except Exception:
+            checkpoint_info = "No checkpoint available"
+
+        print(f"[{datetime.now().isoformat()}] RECOVERY: reheating bed to {bed_temp}°C")
+        sys.stdout.flush()
+        _moonraker_post("/printer/gcode/script",
+                        {"script": f"M140 S{bed_temp}"})
+
+        # Step 6: Send alert with recovery details
+        msg = (f"SV08 Max RECOVERED (attempt {attempt}). "
+               f"Bed reheating to {bed_temp}°C. {checkpoint_info}")
+        print(f"[{datetime.now().isoformat()}] RECOVERY: {msg}")
+        sys.stdout.flush()
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08",
+            "event": "auto_recovery_success",
+            "message": msg,
+        })
+        return True
+
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] RECOVERY: unexpected error: {e}")
+        sys.stdout.flush()
+        return False
+    finally:
+        _recovery_in_progress = False
+
+
 def _check_error_states(data):
-    """Detect printer error/shutdown states and send push alerts.
+    """Detect printer error/shutdown states and attempt auto-recovery.
 
     Checks for: error, shutdown, klippy_shutdown, disconnect.
     Only alerts once per error state transition (not every poll).
+    On SV08 crash: attempts FIRMWARE_RESTART + reheat up to MAX_RECOVERY_ATTEMPTS times.
     """
+    global _recovery_attempts
     error_states = {"error", "shutdown", "klippy_shutdown", "klippy_disconnect"}
 
     # Check SV08
@@ -308,6 +506,37 @@ def _check_error_states(data):
         _write_alert(alert)
         print(f"[{datetime.now().isoformat()}] ALERT: SV08 error state '{sv08_state}': {short_error}")
         sys.stdout.flush()
+
+        # Auto-recovery: attempt FIRMWARE_RESTART + reheat
+        if not _recovery_in_progress and _recovery_attempts < MAX_RECOVERY_ATTEMPTS:
+            print(f"[{datetime.now().isoformat()}] RECOVERY: initiating auto-recovery "
+                  f"({_recovery_attempts}/{MAX_RECOVERY_ATTEMPTS} attempts used)")
+            sys.stdout.flush()
+            recovered = _attempt_recovery()
+            if recovered:
+                _last_alerted_state["sv08"] = None  # allow re-detection if it crashes again
+            else:
+                msg = (f"SV08 auto-recovery FAILED (attempt {_recovery_attempts}/"
+                       f"{MAX_RECOVERY_ATTEMPTS}). Manual intervention may be required.")
+                print(f"[{datetime.now().isoformat()}] {msg}")
+                sys.stdout.flush()
+                _write_alert({
+                    "type": "printer_alert",
+                    "printer": "sv08",
+                    "event": "recovery_failed",
+                    "message": msg,
+                })
+        elif _recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+            msg = (f"SV08 Max: all {MAX_RECOVERY_ATTEMPTS} recovery attempts exhausted. "
+                   f"Manual intervention required.")
+            print(f"[{datetime.now().isoformat()}] {msg}")
+            sys.stdout.flush()
+            _write_alert({
+                "type": "printer_alert",
+                "printer": "sv08",
+                "event": "recovery_exhausted",
+                "message": msg,
+            })
     elif sv08_state not in error_states:
         _last_alerted_state["sv08"] = None
 
@@ -344,12 +573,15 @@ def run_fetch():
 
 
 def main():
+    global _recovery_attempts, _last_print_file
     consecutive_errors = 0
     last_sovol_layer = None
 
     print(f"[{datetime.now().isoformat()}] Printer daemon starting (PID {os.getpid()})")
     print(f"  Polling: {POLL_PRINTING}s printing / {POLL_IDLE}s idle")
     print(f"  Auto-profiling: enabled (triggers on new print or missing profile)")
+    print(f"  Auto-recovery: enabled (max {MAX_RECOVERY_ATTEMPTS} attempts per print)")
+    print(f"  CPU monitoring: sysload>{CPU_LOAD_WARN}, temp>{CPU_TEMP_WARN}°C")
     sys.stdout.flush()
 
     while _running:
@@ -360,14 +592,27 @@ def main():
             # Save position checkpoint while printing
             _save_checkpoint(data)
 
-            # Check for firmware errors/shutdowns and push alerts
+            # Check for firmware errors/shutdowns — triggers auto-recovery
             _check_error_states(data)
+
+            # Reset recovery counter when a new print starts
+            sovol = data.get("printers", {}).get("sovol", {})
+            cur_file = sovol.get("filename", "")
+            if cur_file and cur_file != _last_print_file:
+                _last_print_file = cur_file
+                if _recovery_attempts > 0:
+                    print(f"[{datetime.now().isoformat()}] RECOVERY: counter reset (new print: {cur_file})")
+                    sys.stdout.flush()
+                _recovery_attempts = 0
 
             # Validate saved_variables.cfg periodically (prevent race condition corruption)
             _validate_saved_variables()
 
+            # CPU/thermal monitoring while printing
+            if is_printing(data):
+                _check_cpu_thermal()
+
             # Auto-profile check — on new print AND on each layer change
-            sovol = data.get("printers", {}).get("sovol", {})
             cur_layer = sovol.get("current_layer")
             layer_changed = (cur_layer != last_sovol_layer)
             if layer_changed:

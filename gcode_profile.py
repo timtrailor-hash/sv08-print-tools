@@ -48,7 +48,70 @@ MOONRAKER = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
 PROFILE_DIR = "/tmp/printer_status"
 PROFILE_FILE = os.path.join(PROFILE_DIR, "gcode_profile.json")
 AUTO_SPEED_FILE = os.path.join(PROFILE_DIR, "auto_speed.json")
+EMA_CAL_FILE = os.path.join(PROFILE_DIR, "ema_cal_state.json")
 os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# ── EMA calibration state ───────────────────────────────────────
+# Replaces the global cumulative time_cal_factor with an exponential
+# moving average of per-layer actual/predicted ratios.  EMA adapts to
+# speed regime changes within ~15 layers instead of being dragged by
+# the entire print history.
+EMA_WINDOW = 15
+EMA_ALPHA = 2.0 / (EMA_WINDOW + 1)  # ~0.125 decay
+
+
+def load_ema_cal(filename=""):
+    """Load persisted EMA calibration state for the current print."""
+    try:
+        with open(EMA_CAL_FILE) as f:
+            state = json.load(f)
+        if state.get("filename") == filename and filename:
+            return state
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"ema": 1.0, "n": 0, "last_layer": -1, "filename": filename}
+
+
+def save_ema_cal(state):
+    """Persist EMA state (atomic write)."""
+    tmp = EMA_CAL_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, EMA_CAL_FILE)
+
+
+def update_ema_cal(filename, layer, actual_time_s, predicted_time_s):
+    """Update the EMA with a completed layer's actual/predicted ratio.
+
+    Called on layer transitions from printer_status_fetch or print_eta.
+    For the first 5 layers, uses simple average (cold start stabilisation).
+    After that, uses exponential moving average with window ~15 layers.
+    """
+    if predicted_time_s < 1 or actual_time_s < 1:
+        return
+    state = load_ema_cal(filename)
+    if layer <= state.get("last_layer", -1):
+        return  # already processed
+
+    ratio = actual_time_s / predicted_time_s
+    ratio = max(0.3, min(ratio, 3.0))  # clamp outliers
+    n = state.get("n", 0)
+
+    if n < 5:
+        # Cold start: simple running average (more stable than EMA with few points)
+        old_ema = state.get("ema", 1.0)
+        state["ema"] = (old_ema * n + ratio) / (n + 1)
+    else:
+        state["ema"] = EMA_ALPHA * ratio + (1 - EMA_ALPHA) * state.get("ema", 1.0)
+
+    state["n"] = n + 1
+    state["last_layer"] = layer
+    state["last_ratio"] = round(ratio, 4)
+    state["filename"] = filename
+    save_ema_cal(state)
+    return state
 
 
 # ── Printer kinematics (fetched live, these are fallbacks) ────────
@@ -245,12 +308,9 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
     Two calibrations:
     1. Alpha calibration: raw gcode alphas → scaled to match measured alpha
-    2. Time calibration: raw time_1x_s → scaled to match actual elapsed time
-
-    IMPORTANT: time_cal_factor is computed using the SAME per-layer formula
-    (optimal speed at calibrated alpha) that predictions use.  This ensures
-    the factor is self-consistent — it corrects for systematic model error,
-    not formula mismatch.
+    2. Time calibration: EMA of per-layer actual/predicted ratios (adapts
+       within ~15 layers to speed changes and geometry transitions).
+       Falls back to global cumulative ratio when EMA has no data yet.
 
     Returns a list of dicts: [{layer, calibrated_alpha, optimal_speed_pct,
                                 time_calibrated_s, move_calibrated_s,
@@ -258,6 +318,8 @@ def calibrate_profile(profile, measured_alpha, current_layer,
     """
     if not profile or not profile.get("layers"):
         return []
+
+    filename = profile.get("filename", "")
 
     # Weighted average of raw alphas for layers up to current
     # (weighted by time_1x to give more weight to longer layers)
@@ -279,11 +341,18 @@ def calibrate_profile(profile, measured_alpha, current_layer,
 
     alpha_cal = measured_alpha / avg_raw
 
-    # Time calibration — self-consistent with the prediction formula.
-    # Sum per-layer predictions (at each layer's optimal speed with its
-    # calibrated alpha) for elapsed layers, then compare to actual elapsed.
-    time_cal_factor = 1.0
-    if elapsed_time_s > 60:
+    # Time calibration — use EMA if available, fall back to global ratio.
+    # EMA adapts to speed regime changes within ~15 layers instead of
+    # being dragged by the entire cumulative print history.
+    ema_state = load_ema_cal(filename)
+    ema_n = ema_state.get("n", 0)
+
+    if ema_n >= 3:
+        # EMA has enough data — use it directly
+        time_cal_factor = ema_state["ema"]
+        time_cal_factor = max(0.3, min(time_cal_factor, 3.0))
+    elif elapsed_time_s > 60:
+        # Cold start fallback: global cumulative ratio (same as before)
         predicted_elapsed = 0.0
         for l in profile["layers"]:
             if l["layer"] > current_layer:
@@ -298,6 +367,10 @@ def calibrate_profile(profile, measured_alpha, current_layer,
         if predicted_elapsed > 60:
             time_cal_factor = elapsed_time_s / predicted_elapsed
             time_cal_factor = max(0.3, min(time_cal_factor, 3.0))
+        else:
+            time_cal_factor = 1.0
+    else:
+        time_cal_factor = 1.0
 
     # Apply calibration to all layers
     calibrated = []

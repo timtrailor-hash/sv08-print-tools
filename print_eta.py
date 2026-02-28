@@ -533,6 +533,24 @@ def _log_layer_transition(print_data):
             entry["prediction_error_pct"] = round(
                 (cal_time - actual_time) / actual_time * 100, 1)
 
+        # Feed the EMA calibration with this layer's actual/predicted ratio.
+        # Uses raw profile prediction at actual speed (not calibrated, to
+        # avoid circularity — EMA *is* the calibration).
+        try:
+            from gcode_profile import update_ema_cal
+            raw_move = profile_data.get("profile_move_time_s", 0)
+            raw_fixed = profile_data.get("profile_fixed_overhead_s", 0)
+            raw_alpha = profile_data.get("profile_raw_alpha", 0.1)
+            if raw_move > 0 and actual_time > 5:
+                R_1x = speed_time_ratio(1.0, raw_alpha)
+                R_S = speed_time_ratio(speed_factor, raw_alpha)
+                raw_predicted = raw_move * (R_S / R_1x) + raw_fixed if R_1x > 0 else raw_move + raw_fixed
+                if raw_predicted > 1:
+                    update_ema_cal(filename, _last_logged_layer["layer"],
+                                   actual_time, raw_predicted)
+        except Exception:
+            log.debug("EMA update suppressed", exc_info=True)
+
         try:
             with open(LAYER_LOG_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
