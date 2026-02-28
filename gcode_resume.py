@@ -94,6 +94,9 @@ def parse_and_split(resp, total_bytes, target_layer):
     header_nozzle = None
     line_num = 0
 
+    # Capture EXCLUDE_OBJECT_DEFINE lines from header
+    object_defines = []
+
     # Collect remaining gcode after target layer
     remaining = io.BytesIO()
     found_target = False
@@ -113,6 +116,10 @@ def parse_and_split(resp, total_bytes, target_layer):
                 print(f"  Parsing: {pct:.0f}% (layer {cur_layer})")
                 last_progress = pct
                 start = time.time()
+
+        # Capture EXCLUDE_OBJECT_DEFINE from anywhere before target layer
+        if not found_target and line.startswith("EXCLUDE_OBJECT_DEFINE"):
+            object_defines.append(line)
 
         # Header temperature scan
         if line_num <= 500:
@@ -204,10 +211,10 @@ def parse_and_split(resp, total_bytes, target_layer):
         print(f"ERROR: Layer {target_layer} not found! File has {cur_layer} layers.")
         sys.exit(1)
 
-    return target_state, remaining
+    return target_state, remaining, cur_layer, object_defines
 
 
-def generate_resume_gcode(state, remaining_buf):
+def generate_resume_gcode(state, remaining_buf, total_layers=0, object_defines=None):
     """Build the complete resume gcode file."""
     z = state["z"]
     e = state["e"]
@@ -224,37 +231,36 @@ def generate_resume_gcode(state, remaining_buf):
     lines.append(f"; Original E={e:.3f} F={feedrate} fan={fan}")
     lines.append("")
 
-    # Startup preamble
+    # Startup preamble — QGL yes (probes corners), NO bed mesh (would hit print)
     lines.append("; === STARTUP PREAMBLE ===")
     lines.append(f"M140 S{bed}         ; heat bed")
     lines.append(f"M104 S{nozzle}      ; heat nozzle")
     lines.append(f"M190 S{bed}         ; wait for bed")
     lines.append(f"M109 S{nozzle}      ; wait for nozzle")
     lines.append("G28                  ; home all axes")
-    lines.append("QUAD_GANTRY_LEVEL    ; level gantry")
+    lines.append("QUAD_GANTRY_LEVEL    ; level gantry (probes corners only)")
     lines.append("G28 Z                ; re-home Z after QGL")
-    lines.append("BED_MESH_CALIBRATE   ; fresh bed mesh")
+    lines.append("; NOTE: BED_MESH skipped — partial print on bed")
     lines.append("")
 
     # Position setup
     lines.append("; === POSITION SETUP ===")
     lines.append("G90                  ; absolute positioning")
-    lines.append("M82                  ; absolute extruder")
-    lines.append(f"G92 E{e:.4f}        ; set extruder to where it was")
     lines.append("")
 
-    # Safe approach
+    # Safe approach — use RELATIVE extrusion for purge
     lines.append("; === SAFE APPROACH ===")
     lines.append(f"G1 Z{z + 5:.2f} F600      ; move above print")
-    lines.append(f"G1 X10 Y10 F6000          ; move to corner")
-    purge_e = e + 15
-    retract_e = purge_e - 0.8
-    lines.append(f"G1 E{purge_e:.4f} F150     ; purge 15mm")
-    lines.append(f"G1 E{retract_e:.4f} F2400  ; retract")
+    lines.append(f"G1 X0 Y0 F6000            ; move to bed edge for purge")
+    lines.append("M83                        ; relative extruder for purge")
+    lines.append("G1 E15 F150                ; purge 15mm")
+    lines.append("G1 E-0.8 F2400             ; retract")
     lines.append("")
 
-    # State restoration
+    # Now set absolute extruder to match where the slicer expects it
     lines.append("; === STATE RESTORATION ===")
+    lines.append("M82                        ; absolute extruder")
+    lines.append(f"G92 E{e:.4f}              ; sync E to slicer state")
     if fan > 0:
         lines.append(f"M106 S{fan}          ; restore fan speed")
     else:
@@ -263,7 +269,20 @@ def generate_resume_gcode(state, remaining_buf):
         lines.append(f"SET_VELOCITY_LIMIT ACCEL={accel:.0f}  ; restore accel")
     lines.append("")
 
-    # Move to print position (E is already set correctly)
+    # Tell Klipper total layer count so it can track progress
+    remaining_layers = total_layers - layer if total_layers else 0
+    if remaining_layers > 0:
+        lines.append(f"SET_PRINT_STATS_INFO TOTAL_LAYER_COUNT={remaining_layers}")
+
+    # Object definitions for EXCLUDE_OBJECT support (skip objects in iOS app)
+    if object_defines:
+        lines.append("")
+        lines.append("; === OBJECT DEFINITIONS (for skip support) ===")
+        for od in object_defines:
+            lines.append(od)
+
+    lines.append("")
+    # Remaining gcode from slicer
     lines.append("; === BEGIN REMAINING GCODE ===")
     lines.append("")
 
@@ -331,7 +350,7 @@ def main():
 
     # Stream and parse
     resp, total = stream_gcode(args.file)
-    state, remaining = parse_and_split(resp, total, target_layer)
+    state, remaining, file_total_layers, object_defines = parse_and_split(resp, total, target_layer)
 
     print(f"\nState at layer {target_layer}:")
     print(f"  Z = {state['z']:.2f} mm")
@@ -341,7 +360,8 @@ def main():
 
     # Generate resume file
     print("\nGenerating resume gcode...")
-    resume_data = generate_resume_gcode(state, remaining)
+    resume_data = generate_resume_gcode(state, remaining, total_layers=file_total_layers,
+                                        object_defines=object_defines)
     resume_size = len(resume_data) / 1024 / 1024
     print(f"Resume file size: {resume_size:.1f} MB")
 
