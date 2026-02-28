@@ -268,7 +268,7 @@ def fetch_sovol():
     # Try Ethernet first, fall back to WiFi if unreachable
     for ip in [SOVOL_IP, SOVOL_WIFI_IP]:
         base = f"http://{ip}:{MOONRAKER_PORT}"
-        url = f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report"
+        url = f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report&toolhead"
         try:
             data = json.loads(_fetch_url(url, timeout=5))["result"]["status"]
             result["online"] = True
@@ -311,6 +311,11 @@ def fetch_sovol():
     result["speed_factor"] = gm.get("speed_factor") or 1.0
     result["commanded_speed"] = round((gm.get("speed") or 0) / 60, 1)  # mm/min -> mm/s
     result["live_velocity"] = round(mr.get("live_velocity") or 0, 1)
+
+    # Z position from toolhead for crash recovery checkpoints
+    th = data.get("toolhead", {})
+    pos = th.get("position", [0, 0, 0, 0])
+    result["z_position"] = round(pos[2], 3) if len(pos) > 2 else 0
 
     # Metadata for current file
     if result["filename"]:

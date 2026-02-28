@@ -17,6 +17,8 @@ from datetime import datetime
 
 OUTPUT_DIR = "/tmp/printer_status"
 STATUS_FILE = os.path.join(OUTPUT_DIR, "status.json")
+CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "print_checkpoint.json")
+ALERT_FILE = os.path.join(OUTPUT_DIR, "printer_alerts.jsonl")
 POLL_PRINTING = 15    # seconds between polls when printing
 POLL_IDLE = 300       # seconds between polls when idle
 ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
@@ -25,6 +27,9 @@ MAX_BACKOFF = 300     # max backoff
 # Auto-profiling state
 _last_profiled_file = None
 _profiling_in_progress = False
+
+# Error alerting state
+_last_alerted_state = {"sv08": None, "a1": None}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -123,6 +128,122 @@ def _check_auto_profile(data, force_check=False):
     thread.start()
 
 
+def _save_checkpoint(data):
+    """Save print position checkpoint for crash recovery.
+
+    Writes layer, progress, Z height, filename, speed, and timestamp
+    every poll cycle while printing. Used to determine where a print
+    was when a crash/shutdown occurred.
+    """
+    sovol = data.get("printers", {}).get("sovol", {})
+    state = (sovol.get("state") or "").lower()
+    if state != "printing":
+        return
+
+    checkpoint = {
+        "timestamp": datetime.now().isoformat(),
+        "filename": sovol.get("filename", ""),
+        "state": state,
+        "progress_pct": sovol.get("progress", 0),
+        "current_layer": sovol.get("current_layer", 0),
+        "total_layers": sovol.get("total_layers", 0),
+        "z_position": sovol.get("z_position", 0),
+        "print_duration_s": sovol.get("print_duration", 0),
+        "speed_factor": sovol.get("speed_factor", 1.0),
+        "bed_temp": sovol.get("bed_temp", 0),
+        "nozzle_temp": sovol.get("nozzle_temp", 0),
+        "filament_used_mm": sovol.get("filament_used_mm", 0),
+    }
+
+    try:
+        with open(CHECKPOINT_FILE, "w") as f:
+            json.dump(checkpoint, f, indent=2)
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] CHECKPOINT: write error: {e}")
+        sys.stdout.flush()
+
+
+def _write_alert(alert_dict):
+    """Append an alert to the JSONL file for conversation_server to broadcast."""
+    try:
+        with open(ALERT_FILE, "a") as f:
+            f.write(json.dumps(alert_dict) + "\n")
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] ALERT: write error: {e}")
+        sys.stdout.flush()
+
+
+def _check_error_states(data):
+    """Detect printer error/shutdown states and send push alerts.
+
+    Checks for: error, shutdown, klippy_shutdown, disconnect.
+    Only alerts once per error state transition (not every poll).
+    """
+    error_states = {"error", "shutdown", "klippy_shutdown", "klippy_disconnect"}
+
+    # Check SV08
+    sovol = data.get("printers", {}).get("sovol", {})
+    sv08_state = (sovol.get("state") or "unknown").lower()
+
+    if sv08_state in error_states and _last_alerted_state["sv08"] != sv08_state:
+        _last_alerted_state["sv08"] = sv08_state
+
+        # Try to get more detail from Moonraker
+        error_msg = ""
+        try:
+            import urllib.request
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from printer_config import SOVOL_IP, MOONRAKER_PORT
+            url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/printer/info"
+            with urllib.request.urlopen(url, timeout=5) as r:
+                info = json.loads(r.read())
+            error_msg = info.get("result", {}).get("state_message", "")
+        except Exception:
+            pass
+
+        # Read last checkpoint for context
+        checkpoint_info = ""
+        try:
+            with open(CHECKPOINT_FILE) as f:
+                cp = json.load(f)
+            checkpoint_info = (f" Last checkpoint: {cp.get('progress_pct', 0):.1f}% "
+                             f"(layer {cp.get('current_layer', '?')}/{cp.get('total_layers', '?')}, "
+                             f"Z={cp.get('z_position', '?')}mm)")
+        except Exception:
+            pass
+
+        short_error = error_msg.split("\n")[0][:100] if error_msg else sv08_state
+        alert = {
+            "type": "printer_alert",
+            "printer": "sv08",
+            "event": "firmware_error",
+            "message": f"SV08 Max FIRMWARE ERROR: {short_error}.{checkpoint_info}",
+        }
+        _write_alert(alert)
+        print(f"[{datetime.now().isoformat()}] ALERT: SV08 error state '{sv08_state}': {short_error}")
+        sys.stdout.flush()
+    elif sv08_state not in error_states:
+        _last_alerted_state["sv08"] = None
+
+    # Check A1
+    bambu = data.get("printers", {}).get("bambu", {})
+    a1_state = (bambu.get("state") or "unknown").lower()
+
+    if a1_state in error_states and _last_alerted_state["a1"] != a1_state:
+        _last_alerted_state["a1"] = a1_state
+        alert = {
+            "type": "printer_alert",
+            "printer": "a1",
+            "event": "firmware_error",
+            "message": f"Bambu A1 ERROR: printer in {a1_state} state",
+        }
+        _write_alert(alert)
+        print(f"[{datetime.now().isoformat()}] ALERT: A1 error state '{a1_state}'")
+        sys.stdout.flush()
+    elif a1_state not in error_states:
+        _last_alerted_state["a1"] = None
+
+
 def run_fetch():
     """Run one fetch cycle. Returns the data dict."""
     import printer_status_fetch as fetch
@@ -149,6 +270,12 @@ def main():
         try:
             data = run_fetch()
             consecutive_errors = 0
+
+            # Save position checkpoint while printing
+            _save_checkpoint(data)
+
+            # Check for firmware errors/shutdowns and push alerts
+            _check_error_states(data)
 
             # Auto-profile check — on new print AND on each layer change
             sovol = data.get("printers", {}).get("sovol", {})
