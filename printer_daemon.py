@@ -6,6 +6,8 @@ Writes to /tmp/printer_status/status.json on each cycle.
 Designed to run as a launchd KeepAlive service.
 """
 
+import configparser
+import io
 import json
 import os
 import signal
@@ -13,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 
 OUTPUT_DIR = "/tmp/printer_status"
@@ -27,6 +31,10 @@ MAX_BACKOFF = 300     # max backoff
 # Auto-profiling state
 _last_profiled_file = None
 _profiling_in_progress = False
+
+# saved_variables.cfg validation
+_SAVED_VAR_CHECK_INTERVAL = 300  # 5 minutes
+_last_saved_var_check = 0
 
 # Error alerting state
 _last_alerted_state = {"sv08": None, "a1": None}
@@ -173,6 +181,84 @@ def _write_alert(alert_dict):
         sys.stdout.flush()
 
 
+def _validate_saved_variables():
+    """Check saved_variables.cfg for corruption before Klipper does.
+
+    Fetches the file from Moonraker, parses with ConfigParser, and
+    auto-fixes duplicate keys by keeping the last value. Alerts on
+    any corruption detected.
+    """
+    global _last_saved_var_check
+    now = time.time()
+    if now - _last_saved_var_check < _SAVED_VAR_CHECK_INTERVAL:
+        return
+    _last_saved_var_check = now
+
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from printer_config import SOVOL_IP, MOONRAKER_PORT
+    except ImportError:
+        return
+
+    url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/server/files/config/saved_variables.cfg"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            content = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return  # Printer offline — skip
+
+    # Try parsing — ConfigParser raises on duplicates by default
+    cp = configparser.ConfigParser(strict=True)
+    try:
+        cp.read_string(content)
+        return  # File is valid
+    except (configparser.DuplicateOptionError, configparser.Error) as e:
+        print(f"[{datetime.now().isoformat()}] CORRUPTION DETECTED in saved_variables.cfg: {e}")
+        sys.stdout.flush()
+
+    # Auto-fix: parse non-strictly, rewrite without duplicates
+    cp_fix = configparser.ConfigParser(strict=False)
+    try:
+        cp_fix.read_string(content)
+        fixed = io.StringIO()
+        cp_fix.write(fixed)
+        fixed_content = fixed.getvalue()
+
+        # Upload the fixed file back via Moonraker
+        boundary = "----SavedVarFixBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="saved_variables.cfg"\r\n'
+            f"Content-Type: text/plain\r\n"
+            f'\r\n{fixed_content}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="root"; \r\n'
+            f"\r\nconfig\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+
+        upload_url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/server/files/upload"
+        req = urllib.request.Request(
+            upload_url, data=body, method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[{datetime.now().isoformat()}] AUTO-FIX: saved_variables.cfg rewritten (duplicates removed)")
+        sys.stdout.flush()
+    except Exception as fix_err:
+        print(f"[{datetime.now().isoformat()}] AUTO-FIX FAILED: {fix_err}")
+        sys.stdout.flush()
+
+    # Write alert for conversation_server to broadcast
+    alert = {
+        "type": "printer_alert",
+        "printer": "sv08",
+        "event": "config_corruption",
+        "message": f"SV08 saved_variables.cfg was corrupted (duplicate keys). Auto-fixed.",
+    }
+    _write_alert(alert)
+
+
 def _check_error_states(data):
     """Detect printer error/shutdown states and send push alerts.
 
@@ -276,6 +362,9 @@ def main():
 
             # Check for firmware errors/shutdowns and push alerts
             _check_error_states(data)
+
+            # Validate saved_variables.cfg periodically (prevent race condition corruption)
+            _validate_saved_variables()
 
             # Auto-profile check — on new print AND on each layer change
             sovol = data.get("printers", {}).get("sovol", {})
