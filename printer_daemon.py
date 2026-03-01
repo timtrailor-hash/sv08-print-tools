@@ -35,7 +35,7 @@ RECOVERY_RECONNECT_S = 30       # wait for Klipper to reconnect after FIRMWARE_R
 
 # CPU/thermal alert thresholds
 CPU_LOAD_WARN = 1.2
-CPU_TEMP_WARN = 70.0  # °C
+CPU_TEMP_WARN = 78.0  # °C (H616 normally runs 70-75°C during printing)
 
 # Auto-profiling state
 _last_profiled_file = None
@@ -44,6 +44,7 @@ _profiling_in_progress = False
 # saved_variables.cfg validation
 _SAVED_VAR_CHECK_INTERVAL = 300  # 5 minutes
 _last_saved_var_check = 0
+_last_corruption_alerted = False  # Only alert once per corruption episode
 
 # Error alerting state
 _last_alerted_state = {"sv08": None, "a1": None}
@@ -53,9 +54,13 @@ _recovery_attempts = 0
 _last_print_file = None           # reset recovery counter on new print
 _recovery_in_progress = False
 
+# Layer timing tracking (for extrapolation on resume)
+_layer_times = []          # list of (layer_num, timestamp) for recent layer changes
+_last_tracked_layer = 0    # last layer number we recorded
+
 # CPU/thermal monitoring state
 _last_cpu_alert_time = 0
-_CPU_ALERT_COOLDOWN = 300  # don't re-alert within 5 min
+_CPU_ALERT_COOLDOWN = 1800  # don't re-alert within 30 min
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -160,18 +165,50 @@ def _save_checkpoint(data):
     Writes layer, progress, Z height, filename, speed, and timestamp
     every poll cycle while printing. Used to determine where a print
     was when a crash/shutdown occurred.
+
+    Also tracks layer change timestamps to compute avg_layer_duration_s,
+    which gcode_resume.py uses for time-based layer extrapolation when
+    the checkpoint is stale (daemon was down during crash).
     """
+    global _layer_times, _last_tracked_layer
+
     sovol = data.get("printers", {}).get("sovol", {})
     state = (sovol.get("state") or "").lower()
     if state != "printing":
         return
+
+    cur_layer = sovol.get("current_layer", 0)
+    now = time.time()
+
+    # Track layer transitions
+    if cur_layer > 0 and cur_layer != _last_tracked_layer:
+        _layer_times.append((cur_layer, now))
+        _last_tracked_layer = cur_layer
+        # Keep last 10 transitions
+        if len(_layer_times) > 10:
+            _layer_times = _layer_times[-10:]
+
+    # Compute average layer duration from recent transitions
+    avg_layer_duration = 0.0
+    last_layer_change_iso = ""
+    if len(_layer_times) >= 2:
+        deltas = []
+        for i in range(1, len(_layer_times)):
+            layer_delta = _layer_times[i][0] - _layer_times[i - 1][0]
+            time_delta = _layer_times[i][1] - _layer_times[i - 1][1]
+            if layer_delta > 0:
+                deltas.append(time_delta / layer_delta)
+        if deltas:
+            avg_layer_duration = sum(deltas) / len(deltas)
+    if _layer_times:
+        last_layer_change_iso = datetime.fromtimestamp(_layer_times[-1][1]).isoformat()
 
     checkpoint = {
         "timestamp": datetime.now().isoformat(),
         "filename": sovol.get("filename", ""),
         "state": state,
         "progress_pct": sovol.get("progress", 0),
-        "current_layer": sovol.get("current_layer", 0),
+        "current_layer": cur_layer,
         "total_layers": sovol.get("total_layers", 0),
         "z_position": sovol.get("z_position", 0),
         "print_duration_s": sovol.get("print_duration", 0),
@@ -179,6 +216,8 @@ def _save_checkpoint(data):
         "bed_temp": sovol.get("bed_temp", 0),
         "nozzle_temp": sovol.get("nozzle_temp", 0),
         "filament_used_mm": sovol.get("filament_used_mm", 0),
+        "avg_layer_duration_s": round(avg_layer_duration, 2),
+        "last_layer_change_time": last_layer_change_iso,
     }
 
     try:
@@ -291,10 +330,10 @@ def _validate_saved_variables():
     """Check saved_variables.cfg for corruption before Klipper does.
 
     Fetches the file from Moonraker, parses with ConfigParser, and
-    auto-fixes duplicate keys by keeping the last value. Alerts on
-    any corruption detected.
+    auto-fixes duplicate keys by keeping the last value. Only alerts
+    ONCE per corruption episode (resets when file becomes valid).
     """
-    global _last_saved_var_check
+    global _last_saved_var_check, _last_corruption_alerted
     now = time.time()
     if now - _last_saved_var_check < _SAVED_VAR_CHECK_INTERVAL:
         return
@@ -317,6 +356,10 @@ def _validate_saved_variables():
     cp = configparser.ConfigParser(strict=True)
     try:
         cp.read_string(content)
+        if _last_corruption_alerted:
+            print(f"[{datetime.now().isoformat()}] saved_variables.cfg is now valid again")
+            sys.stdout.flush()
+            _last_corruption_alerted = False
         return  # File is valid
     except (configparser.DuplicateOptionError, configparser.Error) as e:
         print(f"[{datetime.now().isoformat()}] CORRUPTION DETECTED in saved_variables.cfg: {e}")
@@ -355,14 +398,16 @@ def _validate_saved_variables():
         print(f"[{datetime.now().isoformat()}] AUTO-FIX FAILED: {fix_err}")
         sys.stdout.flush()
 
-    # Write alert for conversation_server to broadcast
-    alert = {
-        "type": "printer_alert",
-        "printer": "sv08",
-        "event": "config_corruption",
-        "message": f"SV08 saved_variables.cfg was corrupted (duplicate keys). Auto-fixed.",
-    }
-    _write_alert(alert)
+    # Only alert ONCE per corruption episode
+    if not _last_corruption_alerted:
+        _last_corruption_alerted = True
+        alert = {
+            "type": "printer_alert",
+            "printer": "sv08",
+            "event": "config_corruption",
+            "message": f"SV08 saved_variables.cfg was corrupted. Auto-fix attempted.",
+        }
+        _write_alert(alert)
 
 
 def _attempt_recovery():
@@ -595,7 +640,7 @@ def main():
             # Check for firmware errors/shutdowns — triggers auto-recovery
             _check_error_states(data)
 
-            # Reset recovery counter when a new print starts
+            # Reset recovery counter and layer timing when a new print starts
             sovol = data.get("printers", {}).get("sovol", {})
             cur_file = sovol.get("filename", "")
             if cur_file and cur_file != _last_print_file:
@@ -604,6 +649,8 @@ def main():
                     print(f"[{datetime.now().isoformat()}] RECOVERY: counter reset (new print: {cur_file})")
                     sys.stdout.flush()
                 _recovery_attempts = 0
+                _layer_times.clear()
+                _last_tracked_layer = 0
 
             # Validate saved_variables.cfg periodically (prevent race condition corruption)
             _validate_saved_variables()
