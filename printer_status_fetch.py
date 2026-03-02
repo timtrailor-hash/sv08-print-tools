@@ -57,27 +57,28 @@ PERSISTENT_DIR = os.path.expanduser("~/.local/share/printer")
 os.makedirs(PERSISTENT_DIR, exist_ok=True)
 
 # When run through a symlink, Python resolves the real path and sets sys.path[0]
-# to the repo directory. printer_config.py lives in the parent dir (alongside the
-# symlink), so we need to add that to sys.path for the import to succeed.
+# to the repo directory. printer_registry.py lives in the parent dir (alongside
+# the symlink), so we need to add that to sys.path for the import to succeed.
 _real_dir = os.path.dirname(os.path.realpath(__file__))
 _parent_dir = os.path.dirname(_real_dir)
-if (os.path.isfile(os.path.join(_parent_dir, "printer_config.py"))
-        and _parent_dir not in sys.path):
+if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-try:
-    from printer_config import (SOVOL_IP, SOVOL_WIFI_IP, SOVOL_CAMERA_PORT,
-                                MOONRAKER_PORT, BAMBU_IP, BAMBU_SERIAL,
-                                BAMBU_ACCESS_CODE, BAMBU_MQTT_PORT)
-except ImportError:
-    SOVOL_IP = "[REDACTED — see printer_config.example.py]"
-    SOVOL_WIFI_IP = "[REDACTED — see printer_config.example.py]"
-    SOVOL_CAMERA_PORT = 8081
-    MOONRAKER_PORT = 7125
-    BAMBU_IP = "[REDACTED — see printer_config.example.py]"
-    BAMBU_SERIAL = "[REDACTED — see printer_config.example.py]"
-    BAMBU_ACCESS_CODE = "[REDACTED — see printer_config.example.py]"
-    BAMBU_MQTT_PORT = 8883
+from printer_registry import registry as _registry
+
+# Resolve printer config from registry (backward-compatible variable names)
+_sv08 = _registry.get("sv08_max")
+SOVOL_IP = _sv08.host
+SOVOL_WIFI_IP = _sv08.fallback_host or _sv08.host
+SOVOL_CAMERA_PORT = _sv08.camera.get("port", 8081)
+MOONRAKER_PORT = _sv08.port or 7125
+
+_bambu = _registry.get("bambu_a1")
+_bambu_creds = _bambu.get_bambu_credentials()
+BAMBU_IP = _bambu.host
+BAMBU_SERIAL = _bambu_creds.get("serial", "")
+BAMBU_ACCESS_CODE = _bambu_creds.get("access_code", "")
+BAMBU_MQTT_PORT = _bambu.mqtt_port or 8883
 
 ETA_SNAPSHOTS_FILE = os.path.join(PERSISTENT_DIR, "eta_snapshots.jsonl")
 _SNAPSHOT_INTERVAL_S = 300  # 5 minutes
@@ -88,7 +89,7 @@ _SNAPSHOT_INTERVAL_S = 300  # 5 minutes
 # conversation_server to pick up and push to the iOS app.
 ALERT_FILE = os.path.join(OUTPUT_DIR, "printer_alerts.jsonl")
 _prev_eta_method = {}  # {printer_key: "profile(...)" or "pace+slicer(...)"}
-_prev_fetch_ok = {"sovol": True, "bambu": True}  # track connection health
+_prev_fetch_ok = {_registry.legacy_key(p.id): True for p in _registry.list_enabled()}
 
 
 def _method_family(method_str):
@@ -130,22 +131,27 @@ def check_eta_method_change(printer_key, result):
     family = _method_family(method)
     prev = _prev_eta_method.get(printer_key)
 
+    # Resolve printer name and ID from registry
+    printer_id = _registry.id_from_legacy(printer_key)
+    try:
+        printer_name = _registry.get(printer_id).name
+    except KeyError:
+        printer_name = printer_key
+
     if prev and prev != family:
         if family in ("pace+slicer", "physics"):
-            # Degraded — profile dropped out
-            msg = (f"{'SV08 Max' if 'sovol' in printer_key else 'Bambu A1'}: "
+            msg = (f"{printer_name}: "
                    f"ETA switched from {prev} to {family} — "
                    f"profile calibration lost, predictions less accurate")
             event = "eta_method_degraded"
         else:
-            # Recovered — back to profile
-            msg = (f"{'SV08 Max' if 'sovol' in printer_key else 'Bambu A1'}: "
+            msg = (f"{printer_name}: "
                    f"ETA recovered to {family} (was {prev})")
             event = "eta_method_recovered"
 
         _write_alert({
             "type": "printer_alert",
-            "printer": "sv08" if "sovol" in printer_key else "a1",
+            "printer": printer_id,
             "event": event,
             "message": msg,
             "old_method": prev,
@@ -158,19 +164,23 @@ def check_eta_method_change(printer_key, result):
 def check_connection_health(printer_key, success, error_msg=""):
     """Track connection health and alert on failure/recovery."""
     was_ok = _prev_fetch_ok.get(printer_key, True)
-    name = "SV08 Max" if printer_key == "sovol" else "Bambu A1"
+    printer_id = _registry.id_from_legacy(printer_key)
+    try:
+        name = _registry.get(printer_id).name
+    except KeyError:
+        name = printer_key
 
     if was_ok and not success:
         _write_alert({
             "type": "printer_alert",
-            "printer": "sv08" if printer_key == "sovol" else "a1",
+            "printer": printer_id,
             "event": "connection_lost",
             "message": f"{name}: Connection lost — {error_msg[:100]}",
         })
     elif not was_ok and success:
         _write_alert({
             "type": "printer_alert",
-            "printer": "sv08" if printer_key == "sovol" else "a1",
+            "printer": printer_id,
             "event": "connection_restored",
             "message": f"{name}: Connection restored",
         })
@@ -277,7 +287,7 @@ def fetch_sovol():
         except Exception:
             continue
     else:
-        result["error"] = "unreachable on both ethernet (.52) and wifi (.38)"
+        result["error"] = f"unreachable on both ethernet ({SOVOL_IP}) and wifi ({SOVOL_WIFI_IP})"
         check_connection_health("sovol", False,
                                 "unreachable on ethernet and wifi")
         return result
@@ -340,7 +350,7 @@ def fetch_sovol():
                 tp = biggest.get("relative_path", "")
                 if tp:
                     thumb_url = f"{base}/server/files/gcodes/{urllib.parse.quote(tp)}"
-                    thumb_path = os.path.join(OUTPUT_DIR, "sovol_thumbnail.png")
+                    thumb_path = os.path.join(OUTPUT_DIR, _sv08.camera_thumbnail_file or "sovol_thumbnail.png")
                     with open(thumb_path, "wb") as f:
                         f.write(_fetch_url(thumb_url, timeout=5, retries=2))
                     result["thumbnail"] = thumb_path
@@ -358,7 +368,7 @@ def fetch_sovol():
 
     # Camera snapshot (with timeout to prevent hanging)
     try:
-        cam_path = os.path.join(OUTPUT_DIR, "sovol_camera.jpg")
+        cam_path = os.path.join(OUTPUT_DIR, _sv08.camera_snapshot_file or "sovol_camera.jpg")
         with open(cam_path, "wb") as f:
             f.write(_fetch_url(
                 f"http://{SOVOL_IP}:{SOVOL_CAMERA_PORT}/webcam/?action=snapshot",
@@ -1000,7 +1010,7 @@ def fetch_bambu():
         import subprocess
         import io
 
-        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        cam_path = os.path.join(OUTPUT_DIR, _bambu.camera_snapshot_file or "a1_camera.jpg")
         if not bambu_printing:
             if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
                 result["has_camera"] = True
@@ -1073,14 +1083,14 @@ def fetch_bambu():
             result["has_camera"] = True
     except StopIteration:
         # Not printing — skip FTPS, use cached image
-        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        cam_path = os.path.join(OUTPUT_DIR, _bambu.camera_snapshot_file or "a1_camera.jpg")
         if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
             result["has_camera"] = True
     except Exception as e:
         # Camera capture failed — log it so we can debug
         log.warning("Bambu camera capture failed: %s: %s",
                      type(e).__name__, e)
-        cam_path = os.path.join(OUTPUT_DIR, "a1_camera.jpg")
+        cam_path = os.path.join(OUTPUT_DIR, _bambu.camera_snapshot_file or "a1_camera.jpg")
         if os.path.exists(cam_path) and os.path.getsize(cam_path) > 0:
             result["has_camera"] = True
 
@@ -1153,8 +1163,13 @@ def fetch_bambu():
 if __name__ == "__main__":
     data = {"timestamp": datetime.now().isoformat(), "printers": {}}
 
-    data["printers"]["sovol"] = fetch_sovol()
-    data["printers"]["bambu"] = fetch_bambu()
+    # Fetch each enabled printer using registry legacy keys for backward compat
+    for printer in _registry.list_enabled():
+        legacy_key = _registry.legacy_key(printer.id)
+        if printer.is_klipper:
+            data["printers"][legacy_key] = fetch_sovol()
+        elif printer.is_bambu:
+            data["printers"][legacy_key] = fetch_bambu()
 
     out_path = os.path.join(OUTPUT_DIR, "status.json")
     with open(out_path, "w") as f:
