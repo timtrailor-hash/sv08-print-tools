@@ -278,7 +278,11 @@ def fetch_sovol():
     # Try Ethernet first, fall back to WiFi if unreachable
     for ip in [SOVOL_IP, SOVOL_WIFI_IP]:
         base = f"http://{ip}:{MOONRAKER_PORT}"
-        url = f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report&toolhead"
+        url = (f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder"
+               f"&fan&gcode_move&motion_report&toolhead"
+               f"&temperature_sensor%20mcu_temp&temperature_sensor%20Host_temp"
+               f"&fan_generic%20fan1&fan_generic%20fan2&fan_generic%20fan3"
+               f"&heater_fan%20hotend_fan&heater_fan%20bed_fan")
         try:
             data = json.loads(_fetch_url(url, timeout=5))["result"]["status"]
             result["online"] = True
@@ -326,6 +330,23 @@ def fetch_sovol():
     th = data.get("toolhead", {})
     pos = th.get("position", [0, 0, 0, 0])
     result["z_position"] = round(pos[2], 3) if len(pos) > 2 else 0
+
+    # MCU and host temperatures
+    mcu_sensor = data.get("temperature_sensor mcu_temp", {})
+    host_sensor = data.get("temperature_sensor Host_temp", {})
+    result["mcu_temp"] = round(mcu_sensor.get("temperature") or 0, 1)
+    result["host_temp"] = round(host_sensor.get("temperature") or 0, 1)
+
+    # Fan speeds (0-1 float from Klipper)
+    fan0 = data.get("fan", {})
+    result["fan_speed"] = round((fan0.get("speed") or 0) * 100, 1)  # fan0 = front cooling
+    for i, fan_name in enumerate(["fan1", "fan2", "fan3"], 1):
+        fg = data.get(f"fan_generic {fan_name}", {})
+        result[f"fan{i}_speed"] = round((fg.get("speed") or 0) * 100, 1)
+    hotend_fan = data.get("heater_fan hotend_fan", {})
+    bed_fan_data = data.get("heater_fan bed_fan", {})
+    result["hotend_fan_speed"] = round((hotend_fan.get("speed") or 0) * 100, 1)
+    result["bed_fan_speed"] = round((bed_fan_data.get("speed") or 0) * 100, 1)
 
     # Metadata for current file
     if result["filename"]:
@@ -910,6 +931,19 @@ def fetch_bambu():
             result["speed_level"] = p.get("spd_lvl", 0)
             result["wifi_signal"] = p.get("wifi_signal", "")
             result["print_type"] = p.get("print_type", "")
+            result["chamber_temp"] = round(p.get("chamber_temper") or 0, 1)
+
+            # Fan speeds from Bambu MQTT (0-15 scale → 0-100%)
+            big_fan1 = p.get("big_fan1_speed")
+            big_fan2 = p.get("big_fan2_speed")
+            cooling_fan = p.get("cooling_fan_speed")
+            heatbreak_fan = p.get("heatbreak_fan_speed")
+            if cooling_fan is not None:
+                result["cooling_fan_speed"] = round(int(cooling_fan) / 15 * 100, 1) if isinstance(cooling_fan, (int, str)) else 0
+            if big_fan1 is not None:
+                result["aux_fan_speed"] = round(int(big_fan1) / 15 * 100, 1) if isinstance(big_fan1, (int, str)) else 0
+            if big_fan2 is not None:
+                result["chamber_fan_speed"] = round(int(big_fan2) / 15 * 100, 1) if isinstance(big_fan2, (int, str)) else 0
 
             # AMS info
             ams = p.get("ams", {})
