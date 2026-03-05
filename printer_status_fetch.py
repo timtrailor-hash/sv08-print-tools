@@ -692,6 +692,18 @@ def fetch_sovol():
     except Exception:
         log.debug("suppressed", exc_info=True)  # Profile not available or error — non-critical
 
+    # ── Always surface auto_speed state for UI ──
+    # Independent of profile calibration — ensures the app toggle is readable
+    # at any point in the print, not just when calibration has completed.
+    # Uses setdefault so profile block's richer data takes precedence if set.
+    try:
+        from gcode_profile import load_auto_speed
+        _auto_cfg = load_auto_speed()
+        result.setdefault("auto_speed_enabled", _auto_cfg.get("enabled", False))
+        result.setdefault("auto_speed_mode", _auto_cfg.get("mode", "optimal"))
+    except Exception:
+        log.debug("suppressed", exc_info=True)
+
     # ── Immutable ETA snapshots — save every 5 minutes ──
     # These are frozen predictions that never get recalculated.
     # The ETA graph plots these directly so the algorithm can't
