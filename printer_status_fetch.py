@@ -524,8 +524,10 @@ def fetch_sovol():
                                                            layer_info.get("alpha"))
                 result["layer_avg_segment"] = layer_info.get("avg_segment_mm")
 
-            # Calibrate if we have a live measurement
-            if measured_alpha and measured_alpha > 0.01 and cur_layer > 2:
+            # Calibrate if we have a live measurement.
+            # Guard: skip calibration in early layers (<8) where slow first-layer
+            # speeds bias measured_alpha high and cause autospeed to over-suppress.
+            if measured_alpha and measured_alpha > 0.01 and cur_layer >= 8:
                 cal = calibrate_profile(profile, measured_alpha, cur_layer,
                                         spd, elapsed_time_s=dur)
                 if cal:
@@ -633,18 +635,6 @@ def fetch_sovol():
                                 target_pct = max(round(target_pct * 0.95),
                                     auto_cfg.get("min_speed_pct", 80))
 
-                            # Hard cap: never exceed global optimal from
-                            # measured alpha. Per-layer calibration can
-                            # underestimate complexity; the global
-                            # measurement is ground truth.
-                            try:
-                                from print_eta import optimal_speed_factor
-                                global_opt_pct = round(
-                                    optimal_speed_factor(measured_alpha) * 100)
-                                target_pct = min(target_pct, global_opt_pct)
-                            except Exception:
-                                log.debug("suppressed", exc_info=True)
-
                             # Clamp
                             target_pct = max(
                                 auto_cfg.get("min_speed_pct", 80),
@@ -657,10 +647,15 @@ def fetch_sovol():
                             # If current speed is above optimal (actively
                             # hurting the print), jump immediately — don't
                             # wait for layer change or apply smoothing.
+                            # Use per-layer raw alpha from the gcode profile
+                            # rather than globally-averaged measured_alpha,
+                            # which is biased by slow early layers.
                             try:
                                 from print_eta import speed_time_ratio
-                                hurting = speed_time_ratio(
-                                    spd, measured_alpha) > 1.0
+                                hurting_alpha = (result.get("layer_raw_alpha")
+                                                 or measured_alpha)
+                                hurting = (speed_time_ratio(spd, hurting_alpha) > 1.0
+                                           if hurting_alpha else False)
                             except Exception:
                                 hurting = False
 
