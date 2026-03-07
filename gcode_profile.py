@@ -1150,6 +1150,32 @@ def main():
     os.rename(tmp, PROFILE_FILE)
     print(f"\nProfile saved to {PROFILE_FILE}")
 
+    # Upload to Moonraker so PrinterPilot iOS app can fetch it directly
+    try:
+        import urllib.request
+        moonraker_host = os.environ.get("MOONRAKER_HOST", "192.168.87.52")
+        moonraker_port = os.environ.get("MOONRAKER_PORT", "7125")
+        upload_url = f"http://{moonraker_host}:{moonraker_port}/server/files/upload"
+        boundary = "----ProfileUpload"
+        with open(PROFILE_FILE, "rb") as pf:
+            file_data = pf.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="root"\r\n\r\nconfig\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="gcode_profile.json"\r\n'
+            f"Content-Type: application/json\r\n\r\n"
+        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            upload_url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print("Profile uploaded to Moonraker config/gcode_profile.json")
+    except Exception as e:
+        print(f"Warning: could not upload profile to Moonraker: {e}")
+
     # Print summary
     print_profile_summary(profile)
 
