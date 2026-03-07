@@ -211,14 +211,45 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
         else:
             return {"error": "no data available"}
     else:
-        # ── Measure effective speed from actual progress ──
-        expected_at_1x = estimated_time_s * (progress_pct / 100)
-        effective_speed = expected_at_1x / print_duration_s
+        # ── Windowed effective speed measurement ──
+        # When speed changes significantly, anchor the window to the current
+        # position so that future alpha is measured from the new speed only.
+        # This prevents slow early-layer running from distorting measured_alpha.
+        stored_speed = alpha_state.get("speed_factor", 0)
+        anchor_elapsed = alpha_state.get("anchor_elapsed", 0.0)
+        anchor_progress = alpha_state.get("anchor_progress", 0.0)
+
+        if (stored_speed and S > 1.05
+                and abs(S - stored_speed) / max(stored_speed, 0.1) > 0.10):
+            # Speed changed >10% — reset measurement window to now
+            anchor_elapsed = print_duration_s
+            anchor_progress = progress_pct
+            stored_alpha = None  # Stale alpha no longer valid at new speed
+            _save_alpha_state({
+                "alpha": None,
+                "speed_factor": S,
+                "progress_pct": round(progress_pct, 1),
+                "anchor_elapsed": round(print_duration_s, 1),
+                "anchor_progress": round(progress_pct, 1),
+                "filename": filename,
+                "timestamp": datetime.now().isoformat(),
+            }, printer)
+
+        # Compute effective speed over the window since the anchor
+        window_elapsed = print_duration_s - anchor_elapsed
+        window_progress = progress_pct - anchor_progress
+        if window_elapsed > 30 and window_progress >= 2:
+            expected_window = estimated_time_s * (window_progress / 100)
+            effective_speed = expected_window / window_elapsed
+        else:
+            # Not enough windowed data yet — use full cumulative
+            effective_speed = (estimated_time_s * (progress_pct / 100)
+                               / print_duration_s)
         result["effective_speed"] = round(effective_speed, 2)
 
         # ── Derive alpha from measurement ──
         measured_alpha = None
-        if S > 1.05 and progress_pct >= 3:
+        if S > 1.05 and window_progress >= 3:
             measured_alpha = alpha_from_measurement(effective_speed, S)
 
         # Pick best available alpha
@@ -228,6 +259,8 @@ def calculate_eta(progress_pct, print_duration_s, estimated_time_s,
                 "alpha": round(alpha, 4),
                 "speed_factor": S,
                 "progress_pct": round(progress_pct, 1),
+                "anchor_elapsed": anchor_elapsed,
+                "anchor_progress": anchor_progress,
                 "effective_speed": round(effective_speed, 3),
                 "filename": filename,
                 "timestamp": datetime.now().isoformat(),
