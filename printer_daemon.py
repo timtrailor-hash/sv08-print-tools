@@ -102,17 +102,8 @@ def _auto_profile(filename):
         )
         if result.returncode == 0:
             print(f"[{datetime.now().isoformat()}] AUTO-PROFILE: done for {filename}")
-            # Auto-enable autospeed
-            try:
-                from gcode_profile import load_auto_speed, save_auto_speed
-                cfg = load_auto_speed()
-                if not cfg.get("enabled"):
-                    cfg["enabled"] = True
-                    cfg.setdefault("mode", "optimal")
-                    save_auto_speed(cfg)
-                    print(f"[{datetime.now().isoformat()}] AUTO-PROFILE: autospeed enabled")
-            except Exception as e:
-                print(f"[{datetime.now().isoformat()}] AUTO-PROFILE: autospeed enable failed: {e}")
+            # Note: do NOT auto-enable autospeed here — respect the user's toggle.
+            # Profile data is available whenever autospeed is turned on.
         else:
             print(f"[{datetime.now().isoformat()}] AUTO-PROFILE: failed: {result.stderr[:200]}")
         sys.stdout.flush()
