@@ -57,6 +57,7 @@ _recovery_in_progress = False
 # Layer timing tracking (for extrapolation on resume)
 _layer_times = []          # list of (layer_num, timestamp) for recent layer changes
 _last_tracked_layer = 0    # last layer number we recorded
+_was_sv08_printing = False  # track print→idle transition to clear checkpoint
 
 # CPU/thermal monitoring state
 _last_cpu_alert_time = 0
@@ -618,7 +619,7 @@ def run_fetch():
 
 
 def main():
-    global _recovery_attempts, _last_print_file
+    global _recovery_attempts, _last_print_file, _was_sv08_printing
     consecutive_errors = 0
     last_sovol_layer = None
 
@@ -636,6 +637,21 @@ def main():
 
             # Save position checkpoint while printing
             _save_checkpoint(data)
+
+            # Clear checkpoint when print completes successfully (not on error/crash)
+            sovol_state_raw = (data.get("printers", {}).get("sovol", {}).get("state") or "").lower()
+            sv08_printing_now = sovol_state_raw == "printing"
+            if _was_sv08_printing and not sv08_printing_now:
+                # Only clear on clean finish (standby/complete/ready), NOT on error
+                if sovol_state_raw in ("standby", "complete", "ready", "idle"):
+                    if os.path.exists(CHECKPOINT_FILE):
+                        try:
+                            os.remove(CHECKPOINT_FILE)
+                            print(f"[{datetime.now().isoformat()}] CHECKPOINT: cleared (print finished, state={sovol_state_raw})")
+                            sys.stdout.flush()
+                        except OSError:
+                            pass
+            _was_sv08_printing = sv08_printing_now
 
             # Check for firmware errors/shutdowns — triggers auto-recovery
             _check_error_states(data)
