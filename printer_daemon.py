@@ -407,11 +407,27 @@ def _attempt_recovery():
 
     Sequence: wait → FIRMWARE_RESTART → verify ready → reheat bed → alert.
     Returns True if recovery succeeded, False otherwise.
+    SAFETY: Never sends FIRMWARE_RESTART if a print is active or paused.
     """
     global _recovery_attempts, _recovery_in_progress
     _recovery_in_progress = True
 
     try:
+        # SAFETY GUARD: never restart Klipper if a print is running or paused
+        try:
+            info = _moonraker_get("/printer/objects/query?print_stats")
+            print_state = (info or {}).get("result", {}).get("status", {}).get(
+                "print_stats", {}).get("state", "unknown")
+            if print_state in ("printing", "paused"):
+                print(f"[{datetime.now().isoformat()}] RECOVERY: BLOCKED — print is {print_state}. "
+                      f"Will NOT send FIRMWARE_RESTART. Manual intervention required.")
+                sys.stdout.flush()
+                return False
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] RECOVERY: could not check print state ({e}), aborting for safety")
+            sys.stdout.flush()
+            return False
+
         _recovery_attempts += 1
         attempt = _recovery_attempts
         print(f"[{datetime.now().isoformat()}] RECOVERY: attempt {attempt}/{MAX_RECOVERY_ATTEMPTS}")
