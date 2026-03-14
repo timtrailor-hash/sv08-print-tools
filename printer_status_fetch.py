@@ -644,6 +644,18 @@ def fetch_sovol():
                             current_pct = round(spd * 100)
                             last = auto_cfg.get("last_adjustment", {})
 
+                            # Detect user manual override: if current speed is higher than
+                            # both the target AND the last speed the daemon set, the user
+                            # deliberately increased it above our recommendation — respect it.
+                            # Only the "hurting" path (speed actively degrading print quality)
+                            # may still override, as that's a physics-based safety intervention.
+                            last_daemon_speed = last.get("speed")
+                            user_overrode = (
+                                last_daemon_speed is not None
+                                and current_pct > target_pct
+                                and current_pct > last_daemon_speed
+                            )
+
                             # If current speed is above optimal (actively
                             # hurting the print), jump immediately — don't
                             # wait for layer change or apply smoothing.
@@ -660,13 +672,15 @@ def fetch_sovol():
                                 hurting = False
 
                             should_adjust = False
-                            if hurting and current_pct > target_pct:
+                            if hurting and current_pct > target_pct and not user_overrode:
                                 # Speed is making print slower — force
-                                # immediate drop
+                                # immediate drop (unless user has manually overridden)
                                 should_adjust = True
                             elif (last.get("layer") != cur_layer and
-                                    abs(target_pct - current_pct) > 5):
+                                    abs(target_pct - current_pct) > 5
+                                    and not user_overrode):
                                 # Normal: adjust on layer change
+                                # Skipped if user manually set speed above target
                                 should_adjust = True
 
                             if should_adjust:

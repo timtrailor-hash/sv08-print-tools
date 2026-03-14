@@ -29,7 +29,11 @@ ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
 MAX_BACKOFF = 300     # max backoff
 
 # Auto-recovery constants
-MAX_RECOVERY_ATTEMPTS = 3       # per print job
+# DISABLED: Set to 0 to prevent FIRMWARE_RESTART being sent automatically during/after a print.
+# When Klipper crashes mid-print, print_stats.state transitions away from "printing" before
+# we can query it, so the safety guard in _attempt_recovery() doesn't reliably block.
+# Result: FIRMWARE_RESTART killed multiple multi-hour prints. Manual recovery only.
+MAX_RECOVERY_ATTEMPTS = 0       # per print job — SET TO 0 TO DISABLE AUTO-RECOVERY
 RECOVERY_SETTLE_S = 10          # wait for Klipper to settle after crash
 RECOVERY_RECONNECT_S = 30       # wait for Klipper to reconnect after FIRMWARE_RESTART
 
@@ -633,7 +637,8 @@ def main():
     print(f"[{datetime.now().isoformat()}] Printer daemon starting (PID {os.getpid()})")
     print(f"  Polling: {POLL_PRINTING}s printing / {POLL_IDLE}s idle")
     print(f"  Auto-profiling: enabled (triggers on new print or missing profile)")
-    print(f"  Auto-recovery: enabled (max {MAX_RECOVERY_ATTEMPTS} attempts per print)")
+    recovery_status = f"DISABLED (MAX_RECOVERY_ATTEMPTS=0)" if MAX_RECOVERY_ATTEMPTS == 0 else f"enabled (max {MAX_RECOVERY_ATTEMPTS} attempts)"
+    print(f"  Auto-recovery: {recovery_status}")
     print(f"  CPU monitoring: sysload>{CPU_LOAD_WARN}, temp>{CPU_TEMP_WARN}°C")
     sys.stdout.flush()
 
@@ -660,7 +665,8 @@ def main():
                             pass
             _was_sv08_printing = sv08_printing_now
 
-            # Check for firmware errors/shutdowns — triggers auto-recovery
+            # Check for firmware errors/shutdowns — sends ALERTS only.
+            # Auto-recovery is disabled (MAX_RECOVERY_ATTEMPTS=0) so no FIRMWARE_RESTART is sent.
             _check_error_states(data)
 
             # Reset recovery counter and layer timing when a new print starts
@@ -675,8 +681,10 @@ def main():
                 _layer_times.clear()
                 _last_tracked_layer = 0
 
-            # Validate saved_variables.cfg periodically (prevent race condition corruption)
-            _validate_saved_variables()
+            # Validate saved_variables.cfg — ONLY when not printing.
+            # Writing to the printer's filesystem during a print risks Klipper instability.
+            if not is_printing(data):
+                _validate_saved_variables()
 
             # CPU/thermal monitoring while printing
             if is_printing(data):
