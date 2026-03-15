@@ -29,13 +29,16 @@ ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
 MAX_BACKOFF = 300     # max backoff
 
 # Auto-recovery constants
-# DISABLED: Set to 0 to prevent FIRMWARE_RESTART being sent automatically during/after a print.
+# DISABLED: Set to 0 — FIRMWARE_RESTART requires explicit approval from Tim.
 # When Klipper crashes mid-print, print_stats.state transitions away from "printing" before
-# we can query it, so the safety guard in _attempt_recovery() doesn't reliably block.
-# Result: FIRMWARE_RESTART killed multiple multi-hour prints. Manual recovery only.
-MAX_RECOVERY_ATTEMPTS = 0       # per print job — SET TO 0 TO DISABLE AUTO-RECOVERY
+# we can query it, so the safety guard is unreliable. Multiple prints were killed by auto-restart.
+MAX_RECOVERY_ATTEMPTS = 0       # SET TO 0 — no automatic FIRMWARE_RESTART, ever
 RECOVERY_SETTLE_S = 10          # wait for Klipper to settle after crash
 RECOVERY_RECONNECT_S = 30       # wait for Klipper to reconnect after FIRMWARE_RESTART
+
+# Reconnect grace period — skip error checks briefly after ethernet reconnect
+# Klipper briefly shows "klippy_disconnect"/"error" during MCU reconnect sequence.
+RECONNECT_GRACE_S = 60          # seconds to ignore error states after coming back online
 
 # CPU/thermal alert thresholds
 CPU_LOAD_WARN = 1.2
@@ -57,6 +60,9 @@ _last_alerted_state = {"sv08": None, "a1": None}
 _recovery_attempts = 0
 _last_print_file = None           # reset recovery counter on new print
 _recovery_in_progress = False
+
+# Reconnect grace period tracking
+_last_offline_time = 0.0         # last time sv08 was unreachable (epoch seconds)
 
 # Layer timing tracking (for extrapolation on resume)
 _layer_times = []          # list of (layer_num, timestamp) for recent layer changes
@@ -526,6 +532,16 @@ def _check_error_states(data):
     sovol = data.get("printers", {}).get("sovol", {})
     sv08_state = (sovol.get("state") or "unknown").lower()
 
+    # Reconnect grace period — skip error checks for 60s after ethernet reconnect.
+    # Klipper reliably shows "klippy_disconnect"/"error" during the MCU reconnect sequence,
+    # which would otherwise trigger spurious alerts/restarts.
+    secs_since_offline = time.time() - _last_offline_time
+    if sv08_state in error_states and secs_since_offline < RECONNECT_GRACE_S:
+        print(f"[{datetime.now().isoformat()}] GRACE: ignoring sv08 state '{sv08_state}' "
+              f"— {secs_since_offline:.0f}s since last offline (grace={RECONNECT_GRACE_S}s)")
+        sys.stdout.flush()
+        return
+
     if sv08_state in error_states and _last_alerted_state["sv08"] != sv08_state:
         _last_alerted_state["sv08"] = sv08_state
 
@@ -564,36 +580,17 @@ def _check_error_states(data):
         print(f"[{datetime.now().isoformat()}] ALERT: SV08 error state '{sv08_state}': {short_error}")
         sys.stdout.flush()
 
-        # Auto-recovery: attempt FIRMWARE_RESTART + reheat
-        if not _recovery_in_progress and _recovery_attempts < MAX_RECOVERY_ATTEMPTS:
-            print(f"[{datetime.now().isoformat()}] RECOVERY: initiating auto-recovery "
-                  f"({_recovery_attempts}/{MAX_RECOVERY_ATTEMPTS} attempts used)")
-            sys.stdout.flush()
-            recovered = _attempt_recovery()
-            if recovered:
-                _last_alerted_state["sv08"] = None  # allow re-detection if it crashes again
-            else:
-                msg = (f"SV08 auto-recovery FAILED (attempt {_recovery_attempts}/"
-                       f"{MAX_RECOVERY_ATTEMPTS}). Manual intervention may be required.")
-                print(f"[{datetime.now().isoformat()}] {msg}")
-                sys.stdout.flush()
-                _write_alert({
-                    "type": "printer_alert",
-                    "printer": "sv08",
-                    "event": "recovery_failed",
-                    "message": msg,
-                })
-        elif _recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
-            msg = (f"SV08 Max: all {MAX_RECOVERY_ATTEMPTS} recovery attempts exhausted. "
-                   f"Manual intervention required.")
-            print(f"[{datetime.now().isoformat()}] {msg}")
-            sys.stdout.flush()
-            _write_alert({
-                "type": "printer_alert",
-                "printer": "sv08",
-                "event": "recovery_exhausted",
-                "message": msg,
-            })
+        # FIRMWARE_RESTART requires explicit approval — suggest only, never auto-send.
+        suggest_msg = (f"SV08 Max in '{sv08_state}' state. "
+                       f"FIRMWARE_RESTART may be needed — awaiting your explicit approval.")
+        print(f"[{datetime.now().isoformat()}] SUGGEST: {suggest_msg}")
+        sys.stdout.flush()
+        _write_alert({
+            "type": "printer_alert",
+            "printer": "sv08",
+            "event": "recovery_suggested",
+            "message": suggest_msg,
+        })
     elif sv08_state not in error_states:
         _last_alerted_state["sv08"] = None
 
@@ -630,14 +627,14 @@ def run_fetch():
 
 
 def main():
-    global _recovery_attempts, _last_print_file, _was_sv08_printing
+    global _recovery_attempts, _last_print_file, _was_sv08_printing, _last_offline_time
     consecutive_errors = 0
     last_sovol_layer = None
 
     print(f"[{datetime.now().isoformat()}] Printer daemon starting (PID {os.getpid()})")
     print(f"  Polling: {POLL_PRINTING}s printing / {POLL_IDLE}s idle")
     print(f"  Auto-profiling: enabled (triggers on new print or missing profile)")
-    recovery_status = f"DISABLED (MAX_RECOVERY_ATTEMPTS=0)" if MAX_RECOVERY_ATTEMPTS == 0 else f"enabled (max {MAX_RECOVERY_ATTEMPTS} attempts)"
+    recovery_status = "DISABLED — FIRMWARE_RESTART requires explicit approval" if MAX_RECOVERY_ATTEMPTS == 0 else f"enabled (max {MAX_RECOVERY_ATTEMPTS} attempts)"
     print(f"  Auto-recovery: {recovery_status}")
     print(f"  CPU monitoring: sysload>{CPU_LOAD_WARN}, temp>{CPU_TEMP_WARN}°C")
     sys.stdout.flush()
@@ -665,8 +662,11 @@ def main():
                             pass
             _was_sv08_printing = sv08_printing_now
 
-            # Check for firmware errors/shutdowns — sends ALERTS only.
-            # Auto-recovery is disabled (MAX_RECOVERY_ATTEMPTS=0) so no FIRMWARE_RESTART is sent.
+            # Track offline → online transitions for reconnect grace period
+            if not data.get("printers", {}).get("sovol", {}).get("online", False):
+                _last_offline_time = time.time()
+
+            # Check for firmware errors/shutdowns — alerts only, no auto-restart
             _check_error_states(data)
 
             # Reset recovery counter and layer timing when a new print starts
@@ -681,10 +681,8 @@ def main():
                 _layer_times.clear()
                 _last_tracked_layer = 0
 
-            # Validate saved_variables.cfg — ONLY when not printing.
-            # Writing to the printer's filesystem during a print risks Klipper instability.
-            if not is_printing(data):
-                _validate_saved_variables()
+            # Validate saved_variables.cfg periodically (prevent race condition corruption)
+            _validate_saved_variables()
 
             # CPU/thermal monitoring while printing
             if is_printing(data):
