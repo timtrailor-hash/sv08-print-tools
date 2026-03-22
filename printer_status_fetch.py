@@ -614,90 +614,11 @@ def fetch_sovol():
                             f"α={measured_alpha:.2f})")
                         result["eta_confidence"] = "high"
 
-                    # ── Auto-speed adjustment ──
-                    auto_cfg = load_auto_speed()
-                    if auto_cfg.get("enabled"):
-                        result["auto_speed_enabled"] = True
-                        result["auto_speed_mode"] = auto_cfg.get("mode",
-                                                                 "optimal")
-
-                        # Find target speed for current layer
-                        target_pct = None
-                        for cl in cal:
-                            if cl["layer"] == cur_layer:
-                                target_pct = cl["optimal_speed_pct"]
-                                break
-
-                        if target_pct and cur_layer >= auto_cfg.get(
-                                "skip_first_layers", 2):
-                            # Apply mode
-                            if auto_cfg.get("mode") == "conservative":
-                                target_pct = max(round(target_pct * 0.95),
-                                    auto_cfg.get("min_speed_pct", 80))
-
-                            # Clamp
-                            target_pct = max(
-                                auto_cfg.get("min_speed_pct", 80),
-                                min(target_pct,
-                                    auto_cfg.get("max_speed_pct", 200)))
-
-                            current_pct = round(spd * 100)
-                            last = auto_cfg.get("last_adjustment", {})
-
-                            # Detect user manual override: if current speed is higher than
-                            # both the target AND the last speed the daemon set, the user
-                            # deliberately increased it above our recommendation — respect it.
-                            # Only the "hurting" path (speed actively degrading print quality)
-                            # may still override, as that's a physics-based safety intervention.
-                            last_daemon_speed = last.get("speed")
-                            user_overrode = (
-                                last_daemon_speed is not None
-                                and current_pct > target_pct
-                                and current_pct > last_daemon_speed
-                            )
-
-                            # If current speed is above optimal (actively
-                            # hurting the print), jump immediately — don't
-                            # wait for layer change or apply smoothing.
-                            # Use per-layer raw alpha from the gcode profile
-                            # rather than globally-averaged measured_alpha,
-                            # which is biased by slow early layers.
-                            try:
-                                from print_eta import speed_time_ratio
-                                hurting_alpha = (result.get("layer_raw_alpha")
-                                                 or measured_alpha)
-                                hurting = (speed_time_ratio(spd, hurting_alpha) > 1.0
-                                           if hurting_alpha else False)
-                            except Exception:
-                                hurting = False
-
-                            should_adjust = False
-                            if hurting and current_pct > target_pct and not user_overrode:
-                                # Speed is making print slower — force
-                                # immediate drop (unless user has manually overridden)
-                                should_adjust = True
-                            elif (last.get("layer") != cur_layer and
-                                    abs(target_pct - current_pct) > 5
-                                    and not user_overrode):
-                                # Normal: adjust on layer change
-                                # Skipped if user manually set speed above target
-                                should_adjust = True
-
-                            if should_adjust:
-                                success = set_printer_speed(target_pct)
-                                if success:
-                                    auto_cfg["last_adjustment"] = {
-                                        "layer": cur_layer,
-                                        "speed": target_pct,
-                                        "from_speed": current_pct,
-                                        "alpha": result.get("layer_alpha"),
-                                        "forced": hurting,
-                                        "timestamp": datetime.now().isoformat()
-                                    }
-                                    save_auto_speed(auto_cfg)
-                                    result["speed_adjusted"] = True
-                                    result["speed_adjusted_to"] = target_pct
-                                    result["speed_adjusted_from"] = current_pct
+                    # ── Auto-speed adjustment PERMANENTLY DISABLED 2026-03-22 ──
+                    # Killed multiple prints including a 8.5h Zephyros print.
+                    # Drove printer to 200% → extra_mcu move queue overflow → crash.
+                    # DO NOT RE-ENABLE. Speed must only ever be set manually by Tim.
+                    result["auto_speed_enabled"] = False
     except Exception:
         log.debug("suppressed", exc_info=True)  # Profile not available or error — non-critical
 

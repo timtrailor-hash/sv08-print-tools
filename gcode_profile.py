@@ -852,17 +852,11 @@ def save_auto_speed(config):
 
 
 def set_printer_speed(speed_pct):
-    """Send M220 speed change to the printer."""
-    cmd = f"M220 S{speed_pct}"
-    enc = urllib.parse.quote(cmd)
-    url = f"{MOONRAKER}/printer/gcode/script?script={enc}"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            result = json.loads(r.read())
-        return result.get("result") == "ok"
-    except Exception as e:
-        print(f"Error setting speed: {e}", file=sys.stderr)
-        return False
+    """PERMANENTLY DISABLED 2026-03-22 — killed multiple prints.
+    Autospeed drove printer to 200% causing MCU move queue overflow.
+    Speed must only be set manually by Tim. This function is a no-op."""
+    print(f"set_printer_speed({speed_pct}) BLOCKED — autospeed permanently disabled", file=sys.stderr)
+    return False
 
 
 def smooth_speed_target(target_pct, previous_pct, max_change=30):
