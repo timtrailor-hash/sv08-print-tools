@@ -1215,14 +1215,231 @@ def fetch_bambu():
     return result
 
 
+
+# ── Snapmaker U1 ──────────────────────────────────────────────────────
+_u1 = _registry.get("snapmaker_u1")
+U1_IP = _u1.host
+U1_MOONRAKER_PORT = _u1.port or 7125
+
+
+def fetch_u1():
+    """Fetch Snapmaker U1 status via Moonraker API (read-only)."""
+    result = {"printer": "Snapmaker U1", "online": False}
+
+    base = f"http://{U1_IP}:{U1_MOONRAKER_PORT}"
+    url = (f"{base}/printer/objects/query?print_stats&display_status&heater_bed&extruder"
+           f"&fan&gcode_move&motion_report&toolhead"
+           f"&temperature_sensor%20cavity"
+           f"&fan_generic%20cavity_fan&heater_fan%20power_fan"
+           f"&heater_fan%20e0_nozzle_fan")
+    try:
+        data = json.loads(_fetch_url(url, timeout=5))["result"]["status"]
+        result["online"] = True
+    except Exception as e:
+        result["error"] = f"unreachable at {U1_IP}:{U1_MOONRAKER_PORT}: {e}"
+        check_connection_health("snapmaker", False, str(e))
+        return result
+
+    ps = data.get("print_stats", {})
+    ds = data.get("display_status", {})
+    bed = data.get("heater_bed", {})
+    ext = data.get("extruder", {})
+    gm = data.get("gcode_move", {})
+    mr = data.get("motion_report", {})
+
+    result["state"] = ps.get("state", "unknown")
+    result["filename"] = ps.get("filename", "")
+    result["progress"] = round((ds.get("progress") or 0) * 100, 1)
+    result["print_duration"] = ps.get("print_duration") or 0
+    result["total_duration"] = ps.get("total_duration") or 0
+    result["filament_used_mm"] = ps.get("filament_used") or 0
+    result["bed_temp"] = round(bed.get("temperature") or 0, 1)
+    result["bed_target"] = round(bed.get("target") or 0, 1)
+    result["nozzle_temp"] = round(ext.get("temperature") or 0, 1)
+    result["nozzle_target"] = round(ext.get("target") or 0, 1)
+
+    # Layer progress
+    info = ps.get("info", {})
+    result["current_layer"] = info.get("current_layer") or 0
+    result["total_layers"] = info.get("total_layer") or 0
+    if result["total_layers"] > 0:
+        result["layer_progress"] = round(result["current_layer"] / result["total_layers"] * 100, 1)
+
+    # Speed factor and live velocity
+    result["speed_factor"] = gm.get("speed_factor") or 1.0
+    result["commanded_speed"] = round((gm.get("speed") or 0) / 60, 1)  # mm/min -> mm/s
+    result["live_velocity"] = round(mr.get("live_velocity") or 0, 1)
+
+    # Z position from toolhead
+    th = data.get("toolhead", {})
+    pos = th.get("position", [0, 0, 0, 0])
+    result["z_position"] = round(pos[2], 3) if len(pos) > 2 else 0
+
+    # Cavity (enclosure) temperature
+    cavity = data.get("temperature_sensor cavity", {})
+    result["cavity_temp"] = round(cavity.get("temperature") or 0, 1)
+
+    # Fan speeds (0-1 float from Klipper)
+    fan0 = data.get("fan", {})
+    result["fan_speed"] = round((fan0.get("speed") or 0) * 100, 1)  # part cooling
+    cavity_fan = data.get("fan_generic cavity_fan", {})
+    result["cavity_fan_speed"] = round((cavity_fan.get("speed") or 0) * 100, 1)
+    power_fan = data.get("heater_fan power_fan", {})
+    result["power_fan_speed"] = round((power_fan.get("speed") or 0) * 100, 1)
+    nozzle_fan = data.get("heater_fan e0_nozzle_fan", {})
+    result["nozzle_fan_speed"] = round((nozzle_fan.get("speed") or 0) * 100, 1)
+
+    # Active extruder info (U1 has 4 extruders)
+    result["active_extruder"] = ext.get("extruder_index", 0)
+
+    # Metadata for current file
+    if result["filename"]:
+        enc = urllib.parse.quote(result["filename"])
+        try:
+            meta = json.loads(_fetch_url(
+                f"{base}/server/files/metadata?filename={enc}", timeout=5))["result"]
+            result["estimated_time"] = meta.get("estimated_time") or 0
+            result["filament_total_mm"] = meta.get("filament_total") or 0
+            result["filament_weight_g"] = meta.get("filament_weight_total") or 0
+            result["slicer"] = meta.get("slicer", "")
+            result["layer_height"] = meta.get("layer_height") or 0
+            result["object_height"] = meta.get("object_height") or 0
+            result["filament_name"] = meta.get("filament_name", "")
+            result["filament_type"] = meta.get("filament_type", "")
+
+            # Thumbnail
+            thumbs = meta.get("thumbnails", [])
+            if thumbs:
+                biggest = max(thumbs, key=lambda t: t.get("width", 0) * t.get("height", 0))
+                tp = biggest.get("relative_path", "")
+                if tp:
+                    thumb_url = f"{base}/server/files/gcodes/{urllib.parse.quote(tp)}"
+                    thumb_path = os.path.join(OUTPUT_DIR, "u1_thumbnail.png")
+                    with open(thumb_path, "wb") as f:
+                        f.write(_fetch_url(thumb_url, timeout=5, retries=2))
+                    result["thumbnail"] = thumb_path
+                    result["has_thumbnail"] = True
+        except Exception as e:
+            result["meta_error"] = str(e)
+
+        # Print start time from history
+        try:
+            hist = json.loads(_fetch_url(
+                f"{base}/server/history/list?limit=1&order=desc", timeout=5))["result"]
+            if hist.get("jobs"):
+                result["start_time"] = hist["jobs"][0].get("start_time", 0)
+        except Exception:
+            _log_exc("fetch_u1_history")
+
+    # Calculate times
+    if result.get("start_time"):
+        result["start_str"] = datetime.fromtimestamp(result["start_time"]).strftime("%a %d %b %H:%M")
+    dur = result.get("print_duration", 0)
+    result["duration_str"] = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
+
+    # Naive ETA (no profile/autospeed for U1 yet)
+    prog = result.get("progress", 0)
+    if prog > 0:
+        actual_total = dur / (prog / 100)
+        remaining = actual_total - dur
+        eta = datetime.now() + timedelta(seconds=remaining)
+        result["remaining_str"] = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+        result["eta_str"] = eta.strftime("%a %d %b %H:%M")
+        result["eta_method"] = "pace"
+        result["eta_confidence"] = "medium"
+
+    # Filament usage
+    fil_used_m = result.get("filament_used_mm", 0) / 1000
+    fil_total_m = result.get("filament_total_mm", 0) / 1000
+    if fil_total_m > 0:
+        result["filament_used_m"] = round(fil_used_m, 1)
+        result["filament_total_m"] = round(fil_total_m, 1)
+        result["filament_pct"] = round(fil_used_m / fil_total_m * 100)
+        wt = result.get("filament_weight_g", 0)
+        if wt:
+            result["filament_used_g"] = round(wt * (fil_used_m / fil_total_m))
+            result["filament_total_g"] = round(wt)
+
+    result["current_speed_pct"] = round(result.get("speed_factor", 1.0) * 100)
+
+    # Extract model name from filename
+    fn = result.get("filename", "")
+    name = fn.replace(".gcode", "").replace(".3mf", "")
+    result["model_name"] = name.replace("_", " ").strip()
+
+    # Immutable ETA snapshots (shared file)
+    if result.get("state") == "printing" and result.get("remaining_str"):
+        _save_eta_snapshot(result)
+
+    # ETA history from immutable snapshots (for drift graph)
+    try:
+        snap_path = ETA_SNAPSHOTS_FILE
+        cur_file = result.get("filename", "")
+        if os.path.exists(snap_path) and cur_file:
+            eta_history = []
+            with open(snap_path) as sf:
+                for line in sf:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("filename") != cur_file:
+                            continue
+                        finish_ts = entry.get("predicted_finish_ts", 0)
+                        prog_snap = entry.get("progress", 0)
+                        if finish_ts > 0 and prog_snap > 0:
+                            eta_history.append({
+                                "progress": prog_snap,
+                                "elapsed_h": round(
+                                    entry.get("elapsed_s", 0) / 3600, 2),
+                                "remaining_h": round(
+                                    entry.get("remaining_s", 0) / 3600, 2),
+                                "finish_ts": finish_ts,
+                                "finish_str": entry.get(
+                                    "predicted_finish_str", ""),
+                            })
+                    except Exception:
+                        continue
+            # Detect reprints
+            if len(eta_history) >= 2:
+                last_reset = 0
+                for i in range(1, len(eta_history)):
+                    prev_prog = eta_history[i - 1]["progress"]
+                    curr_prog = eta_history[i]["progress"]
+                    if curr_prog < prev_prog - 5:
+                        last_reset = i
+                if last_reset > 0:
+                    eta_history = eta_history[last_reset:]
+            # Smooth sawtooth
+            if len(eta_history) >= 2:
+                by_prog = {}
+                for entry in eta_history:
+                    by_prog[entry["progress"]] = entry
+                eta_history = sorted(by_prog.values(),
+                                     key=lambda e: e["elapsed_h"])
+            if len(eta_history) >= 2:
+                result["eta_history"] = eta_history
+    except Exception:
+        log.debug("suppressed", exc_info=True)
+
+    # Connection health alerts
+    check_connection_health("snapmaker", result.get("online", False),
+                            result.get("error", ""))
+
+    return result
+
+
 if __name__ == "__main__":
     data = {"timestamp": datetime.now().isoformat(), "printers": {}}
 
     # Fetch each enabled printer using registry legacy keys for backward compat
+    # Dispatch by printer ID for klipper printers with dedicated fetch functions
+    _klipper_fetchers = {
+        "sv08_max": fetch_sovol,
+        "snapmaker_u1": fetch_u1,
+    }
     for printer in _registry.list_enabled():
         legacy_key = _registry.legacy_key(printer.id)
-        if printer.is_klipper:
-            data["printers"][legacy_key] = fetch_sovol()
+        if printer.id in _klipper_fetchers:
+            data["printers"][legacy_key] = _klipper_fetchers[printer.id]()
         elif printer.is_bambu:
             data["printers"][legacy_key] = fetch_bambu()
 

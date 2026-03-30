@@ -619,6 +619,7 @@ def run_fetch():
     data = {"timestamp": datetime.now().isoformat(), "printers": {}}
     data["printers"]["sovol"] = fetch.fetch_sovol()
     data["printers"]["bambu"] = fetch.fetch_bambu()
+    data["printers"]["snapmaker"] = fetch.fetch_u1()
 
     with open(STATUS_FILE, "w") as f:
         json.dump(data, f, indent=2)
