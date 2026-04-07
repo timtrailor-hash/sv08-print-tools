@@ -2,13 +2,10 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: [main, master]
 
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
   claude-review:
@@ -21,23 +18,25 @@ jobs:
           fetch-depth: 0
 
       - name: Claude Code Review
-        uses: anthropics/claude-code-action@v1
+        # Pinned to v1 SHA (resolved 2026-04-07) — float to v1 only when intentionally upgrading
+        uses: anthropics/claude-code-action@f2accb9a171bd71f4b5c93bcea23876aa5244edb
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           model: claude-haiku-4-5-20251001
           direct_prompt: |
-            You are reviewing this change against Tim's standard quality bar.
+            You are reviewing this PR against Tim's quality bar. Be terse.
 
             Apply these checks:
             1. Security: hardcoded credentials, command injection, unsafe subprocess, leaked tokens
             2. Correctness: null/None handling, error paths, race conditions
-            3. Printer safety (only if this repo touches Klipper/Moonraker/G-code):
-               - state check before every command
-               - allowlist enforcement
+            3. Drift: hardcoded /Users/timtrailor/Documents paths that won't work on Mac Mini
+            4. Printer safety (only if this repo touches Klipper/Moonraker/G-code):
+               - state check before every command via print_stats.state
+               - allowlist enforcement (PAUSE/RESUME/M117/M220/M221/SET_FAN_SPEED/SET_GCODE_OFFSET/CANCEL_PRINT_CONFIRMED only during prints)
+               - never FIRMWARE_RESTART, RESTART, SAVE_CONFIG, G28, BED_MESH_CALIBRATE, QUAD_GANTRY_LEVEL during a print
                - kill switch documented
-            4. Drift: hardcoded /Users/timtrailor/Documents paths that won't work on Mac Mini
 
-            Be terse. Only flag real issues. Format:
+            Format findings as:
             - [SEVERITY] file:line — issue (one-line fix)
 
             If no issues, reply "LGTM".
