@@ -938,7 +938,22 @@ def fetch_bambu():
                 return
             p = data["print"]
             result["online"] = True
-            result["state"] = p.get("gcode_state", "unknown")
+            # Normalize Bambu gcode_state to the same vocabulary Klipper uses,
+            # so conversation_server.py's _describe_state_change (which now
+            # requires exact state names) treats Bambu and Klipper printers
+            # identically. Without this, Bambu transitions are silent.
+            # Mapping: RUNNING/PREPARE -> printing, PAUSE -> paused,
+            # FINISH -> complete, FAILED -> cancelled, IDLE -> standby.
+            _bambu_state_raw = p.get("gcode_state", "unknown")
+            _bambu_state_map = {
+                "RUNNING": "printing",
+                "PREPARE": "printing",
+                "PAUSE": "paused",
+                "FINISH": "complete",
+                "FAILED": "cancelled",
+                "IDLE": "standby",
+            }
+            result["state"] = _bambu_state_map.get(_bambu_state_raw.upper(), _bambu_state_raw.lower())
             result["progress"] = p.get("mc_percent") or 0
             result["remaining_min"] = p.get("mc_remaining_time") or 0
             result["filename"] = p.get("gcode_file", "")
