@@ -24,7 +24,7 @@ STATUS_FILE = os.path.join(OUTPUT_DIR, "status.json")
 CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "print_checkpoint.json")
 ALERT_FILE = os.path.join(OUTPUT_DIR, "printer_alerts.jsonl")
 POLL_PRINTING = 15    # seconds between polls when printing
-POLL_IDLE = 300       # seconds between polls when idle
+POLL_IDLE = 90        # seconds between polls when idle (keeps status.json fresh enough for conv-server /health to stay green; ClaudeControl's red threshold is 300s)
 ERROR_BACKOFF = 60    # seconds to wait after consecutive errors
 MAX_BACKOFF = 300     # max backoff
 
