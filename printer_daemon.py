@@ -7,6 +7,7 @@ Designed to run as a launchd KeepAlive service.
 """
 
 import configparser
+import hashlib
 import io
 import json
 import os
@@ -328,6 +329,52 @@ def _check_cpu_thermal():
         })
 
 
+_CORRUPTION_ALERT_STATE = os.path.expanduser("~/.claude/sv08_corruption_alerted")
+
+
+def _alert_corruption(message, fingerprint):
+    """Alert at most once per DISTINCT corruption, across daemon restarts.
+
+    The in-memory flag alone re-alerted on every reload of this daemon, which
+    is how a single known problem produced a stream of identical emails. The
+    fingerprint is the broken file's content, so the same breakage never
+    alerts twice and a genuinely new one still does.
+    """
+    global _last_corruption_alerted
+    if _last_corruption_alerted:
+        return
+    try:
+        with open(_CORRUPTION_ALERT_STATE) as f:
+            if f.read().strip() == fingerprint:
+                _last_corruption_alerted = True
+                return  # already told him about exactly this
+    except OSError:
+        pass
+    _last_corruption_alerted = True
+    try:
+        os.makedirs(os.path.dirname(_CORRUPTION_ALERT_STATE), exist_ok=True)
+        with open(_CORRUPTION_ALERT_STATE, "w") as f:
+            f.write(fingerprint)
+    except OSError:
+        pass
+    _write_alert({
+        "type": "printer_alert",
+        "printer": "sv08",
+        "event": "config_corruption",
+        "message": message,
+    })
+
+
+def _clear_corruption_alert():
+    """Forget the alerted-about corruption once the file is healthy again."""
+    global _last_corruption_alerted
+    _last_corruption_alerted = False
+    try:
+        os.remove(_CORRUPTION_ALERT_STATE)
+    except OSError:
+        pass
+
+
 def _validate_saved_variables():
     """Check saved_variables.cfg for corruption before Klipper does.
 
@@ -358,58 +405,63 @@ def _validate_saved_variables():
     cp = configparser.ConfigParser(strict=True)
     try:
         cp.read_string(content)
-        if _last_corruption_alerted:
+        if _last_corruption_alerted or os.path.exists(_CORRUPTION_ALERT_STATE):
             print(f"[{datetime.now().isoformat()}] saved_variables.cfg is now valid again")
             sys.stdout.flush()
-            _last_corruption_alerted = False
+            _clear_corruption_alert()
         return  # File is valid
     except (configparser.DuplicateOptionError, configparser.Error) as e:
         print(f"[{datetime.now().isoformat()}] CORRUPTION DETECTED in saved_variables.cfg: {e}")
         sys.stdout.flush()
 
-    # Auto-fix: parse non-strictly, rewrite without duplicates
-    cp_fix = configparser.ConfigParser(strict=False)
-    try:
-        cp_fix.read_string(content)
-        fixed = io.StringIO()
-        cp_fix.write(fixed)
-        fixed_content = fixed.getvalue()
-
-        # Upload the fixed file back via Moonraker
-        boundary = "----SavedVarFixBoundary"
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="saved_variables.cfg"\r\n'
-            f"Content-Type: text/plain\r\n"
-            f'\r\n{fixed_content}\r\n'
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="root"; \r\n'
-            f"\r\nconfig\r\n"
-            f"--{boundary}--\r\n"
-        ).encode("utf-8")
-
-        upload_url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/server/files/upload"
-        req = urllib.request.Request(
-            upload_url, data=body, method="POST",
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-        print(f"[{datetime.now().isoformat()}] AUTO-FIX: saved_variables.cfg rewritten (duplicates removed)")
+    # Only repair when the printer is idle. Writing this file mid-print races
+    # Klipper's own SAVE_VARIABLE writes, which is how the orphan lines appear
+    # in the first place. Fail closed: if the state cannot be read, do nothing.
+    info = _moonraker_get("/printer/objects/query?print_stats")
+    state = None
+    if info:
+        state = info.get("result", {}).get("status", {}).get(
+            "print_stats", {}).get("state")
+    if state is None or state in ("printing", "paused"):
+        # Log only. A scheduled repair that is simply waiting its turn is not
+        # news, and emailing it every cycle is the flood this check exists to
+        # avoid. He hears from us only if the repair actually fails.
+        print(f"[{datetime.now().isoformat()}] AUTO-FIX DEFERRED: printer state={state}")
         sys.stdout.flush()
+        return  # retried on the next interval once the job ends
+
+    # Repair by asking Klipper to rewrite the file from its own in-memory
+    # variables. ConfigParser(strict=False) is NOT enough here: a line with no
+    # "=" (e.g. a bare "'0.0'" left by a half-written key) raises regardless of
+    # strict, which is why every previous auto-fix attempt failed silently.
+    # Letting Klipper write also keeps file and memory in step; uploading the
+    # file behind Klipper's back does not, and is overwritten on its next save.
+    try:
+        varname = "last_saved_var_repair"
+        resp = _moonraker_post(
+            "/printer/gcode/script",
+            {"script": f"SAVE_VARIABLE VARIABLE={varname} VALUE={int(now)}"},
+        )
+        if resp is None:
+            raise RuntimeError("SAVE_VARIABLE call failed")
+
+        with urllib.request.urlopen(url, timeout=5) as r:
+            after = r.read().decode("utf-8", errors="replace")
+        configparser.ConfigParser(strict=True).read_string(after)
+        print(f"[{datetime.now().isoformat()}] AUTO-FIX: Klipper rewrote saved_variables.cfg, now parses clean")
+        sys.stdout.flush()
+        _clear_corruption_alert()
+        return  # repaired; success is silent
     except Exception as fix_err:
         print(f"[{datetime.now().isoformat()}] AUTO-FIX FAILED: {fix_err}")
         sys.stdout.flush()
 
-    # Only alert ONCE per corruption episode
-    if not _last_corruption_alerted:
-        _last_corruption_alerted = True
-        alert = {
-            "type": "printer_alert",
-            "printer": "sv08",
-            "event": "config_corruption",
-            "message": f"SV08 saved_variables.cfg was corrupted. Auto-fix attempted.",
-        }
-        _write_alert(alert)
+    # A failed repair is worth exactly one email, keyed on the broken content,
+    # so a daemon reload or a second attempt on the same breakage stays quiet.
+    _alert_corruption(
+        f"SV08 saved_variables.cfg is corrupted and the repair FAILED: {fix_err}",
+        hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
+    )
 
 
 def _attempt_recovery():
